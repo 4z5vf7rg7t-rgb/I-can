@@ -1,0 +1,2600 @@
+import React, { useState, useMemo } from 'react';
+import {
+  Globe, Briefcase, Plane, Compass, Search, CheckCircle2,
+  AlertCircle, XCircle, ChevronRight, X, Sparkles,
+  ArrowUpRight, Bookmark, ShieldAlert, Newspaper, Moon,
+  Sun, Building2, MapPin, Check, Flame, PhoneCall,
+  RefreshCw, MessageSquarePlus, ThumbsUp, AlertTriangle,
+  Clock, ShieldCheck, SlidersHorizontal, RotateCcw
+} from 'lucide-react';
+
+// ============================================================================
+// 1. 자가 진화 코어 엔진 (Auto-Diff · Time-Decay Ranking · Edge-Case Resolver)
+// ============================================================================
+export type PassportCode = 'KR' | 'CN' | 'US';
+
+export interface VisaRuleDetail {
+  whvAvailable: boolean;
+  visaName: string;
+  ageRange: string;
+  minAge: number;
+  maxAge: number;
+  quotaKo: string;
+  quotaEn: string;
+  feeText: string;
+  recentlyChanged: boolean;
+  lastVerifiedAt: string;
+  reqKo: string[];
+  reqEn: string[];
+  stepsKo: string[];
+  stepsEn: string[];
+  travelStatus: 'free' | 'eta' | 'visa';
+  travelLabelKo: string;
+  travelLabelEn: string;
+  travelFee: string;
+  travelStepsKo: string[];
+  travelStepsEn: string[];
+  travelDocsKo: string[];
+  travelDocsEn: string[];
+  workVisa: string;
+  workNoteKo: string;
+  workNoteEn: string;
+}
+
+export interface CountryNode {
+  id: string;
+  code: string;
+  countryKo: string;
+  countryEn: string;
+  cityKo: string;
+  cityEn: string;
+  jobsCount: number;
+  avgSalaryKo: string;
+  avgSalaryEn: string;
+  safetyLevel: 'normal' | 'caution' | 'alert';
+  emergencyNumber: string;
+  legalDrinkingAge: number;
+  newsAlerts: {
+    tagKo: string;
+    tagEn: string;
+    titleKo: string;
+    titleEn: string;
+    date: string;
+  }[];
+  lifestyle: {
+    dayKo: string[];
+    dayEn: string[];
+    nightKo: string[];
+    nightEn: string[];
+    nightTipKo: string;
+    nightTipEn: string;
+  };
+  rulesByPassport: Record<PassportCode, VisaRuleDetail>;
+}
+
+export interface FieldReview {
+  id: string;
+  countryId: string;
+  passportCode: PassportCode;
+  category: 'visa' | 'safety' | 'nightlife';
+  summary: string;
+  createdAtMs: number;
+  createdAtLabelKo: string;
+  createdAtLabelEn: string;
+  helpfulCount: number;
+  outdatedCount: number;
+  verifiedBySystem?: boolean;
+  containsSpamPattern?: boolean;
+}
+
+export interface UserProfileContext {
+  passport: PassportCode;
+  birthYear: number | null;
+  visitedWhvCountries: string[];
+  interestWeights: Record<string, number>;
+}
+
+// 시간 감쇠(Time-Decay) + 스팸/구정보 필터링 후기 랭킹 엔진
+export function rankAndFilterReviews(reviews: FieldReview[], nowMs = Date.now()) {
+  const ONE_DAY_MS = 1000 * 60 * 60 * 24;
+  const SPAM_REGEX = /(카톡|텔레그램|라인문의|광고|도박|홍보링크|http:\/\/|https:\/\/)/i;
+
+  return reviews
+    .filter((rev) => {
+      if (rev.containsSpamPattern || SPAM_REGEX.test(rev.summary)) return false;
+      if (rev.outdatedCount >= 4 && rev.outdatedCount > rev.helpfulCount) return false;
+      return true;
+    })
+    .map((rev) => {
+      const ageInDays = Math.max(0, (nowMs - rev.createdAtMs) / ONE_DAY_MS);
+      const freshnessMultiplier = Math.exp(-ageInDays / 30);
+      const netHelpful = Math.max(0, rev.helpfulCount - rev.outdatedCount * 1.5);
+      const dynamicScore = (netHelpful + 1) * freshnessMultiplier;
+
+      return {
+        ...rev,
+        ageInDays,
+        dynamicScore,
+        isFresh: ageInDays <= 14,
+      };
+    })
+    .sort((a, b) => b.dynamicScore - a.dynamicScore);
+}
+
+// 사용자 나이·과거 워홀 이력·규정 변경·관심도를 결합한 엣지케이스 판별 엔진
+export function evaluateCountryForUser(
+  country: CountryNode,
+  user: UserProfileContext,
+  currentYear = 2026
+) {
+  const rule = country.rulesByPassport[user.passport];
+  const warnings: { ko: string; en: string; tone: 'info' | 'warn' | 'urgent' }[] = [];
+
+  let effectiveWhvAvailable = rule.whvAvailable;
+  let whvStatusBadgeKo = rule.whvAvailable ? `신청 가능 (${rule.ageRange})` : '협정 미체결';
+  let whvStatusBadgeEn = rule.whvAvailable ? `Available (${rule.ageRange})` : 'Not Available';
+
+  if (user.visitedWhvCountries.includes(country.id)) {
+    effectiveWhvAvailable = false;
+    whvStatusBadgeKo = '워홀 이력 있음 · 대안 경로';
+    whvStatusBadgeEn = 'Prior WHV · Alt Path';
+    warnings.push({
+      ko: '해당 국가 워홀 이력이 감지되어 취업/유학 비자 경로를 우선 안내합니다.',
+      en: 'Prior WHV detected; prioritizing skilled work or study pathways.',
+      tone: 'warn',
+    });
+  }
+
+  if (user.birthYear) {
+    const age = currentYear - user.birthYear;
+    if (effectiveWhvAvailable && age > rule.maxAge) {
+      effectiveWhvAvailable = false;
+      whvStatusBadgeKo = `만 ${rule.maxAge}세 초과 · 취업비자 전환`;
+      whvStatusBadgeEn = `Over Age ${rule.maxAge} · Work Visa`;
+      warnings.push({
+        ko: `현재 만 ${age}세로 워홀 상한(만 ${rule.maxAge}세)을 넘어 일반 취업비자 경로를 추천합니다.`,
+        en: `Age ${age} exceeds WHV limit (${rule.maxAge}); highlighting work sponsorship.`,
+        tone: 'warn',
+      });
+    } else if (effectiveWhvAvailable && age === rule.maxAge) {
+      warnings.push({
+        ko: `만 ${rule.maxAge}세 해당 연령입니다. 신청 마감·쿼터 일정을 빠르게 확인하세요.`,
+        en: `Final eligible age (${rule.maxAge}) for WHV. Check quota & deadlines soon.`,
+        tone: 'urgent',
+      });
+    }
+  }
+
+  if (rule.recentlyChanged) {
+    warnings.push({
+      ko: `최근 비자 수수료·규정 업데이트 감지 (${rule.lastVerifiedAt})`,
+      en: `Recent visa rule/fee update detected (${rule.lastVerifiedAt})`,
+      tone: 'info',
+    });
+  }
+
+  const interestScore = user.interestWeights[country.id] || 0;
+  const priorityScore = interestScore * 2 + (effectiveWhvAvailable ? 3 : 0);
+
+  return {
+    rule,
+    effectiveWhvAvailable,
+    whvStatusBadgeKo,
+    whvStatusBadgeEn,
+    warnings,
+    interestScore,
+    priorityScore,
+  };
+}
+
+// ============================================================================
+// 2. 8개국 통합 데이터 (AU · JP · CA · DE + TH · VN · PH · UK)
+// ============================================================================
+const PASSPORTS: { code: PassportCode; nameKo: string; nameEn: string }[] = [
+  { code: 'KR', nameKo: '대한민국', nameEn: 'South Korea' },
+  { code: 'CN', nameKo: '중국', nameEn: 'China' },
+  { code: 'US', nameKo: '미국', nameEn: 'United States' },
+];
+
+const INITIAL_COUNTRIES: CountryNode[] = [
+  {
+    id: 'au',
+    code: 'AU',
+    countryKo: '호주',
+    countryEn: 'Australia',
+    cityKo: '시드니 · 멜버른',
+    cityEn: 'Sydney · Melbourne',
+    jobsCount: 1420,
+    avgSalaryKo: '연 7,200만 원~',
+    avgSalaryEn: 'AUD 82,000+ / yr',
+    safetyLevel: 'normal',
+    emergencyNumber: '000',
+    legalDrinkingAge: 18,
+    newsAlerts: [
+      {
+        tagKo: '검역 · 입국',
+        tagEn: 'Biosecurity',
+        titleKo: '식품·동식물 검역 엄격 적용 — 미신고 반입 시 벌금 또는 비자 취소 주의',
+        titleEn: 'Strict biosecurity checks; undeclared food/plant items risk fines or visa cancellation',
+        date: '2026.11',
+      },
+      {
+        tagKo: '치안 · 생활',
+        tagEn: 'Safety',
+        titleKo: '치안 안정적이나 도심 심야 대중교통·인기 해변 소매치기 및 자외선 주의',
+        titleEn: 'Generally safe; watch for petty theft late at night and high UV exposure',
+        date: '2026.11',
+      },
+    ],
+    lifestyle: {
+      dayKo: ['본다이 비치 서핑 & 해안 트레킹', '멜버른 스페셜티 커피 투어', '블루마운틴 국립공원 하이킹'],
+      dayEn: ['Bondi Beach surfing & coastal walk', 'Melbourne coffee laneways', 'Blue Mountains hiking'],
+      nightKo: ['서리힐스(Surry Hills) 루프탑 칵테일 바', '달링하버 하버뷰 라운지 & 라이브 펍', '멜버른 채플 스트리트 클럽 & 재즈 바'],
+      nightEn: ['Surry Hills rooftop cocktail bars', 'Darling Harbour lounges & pubs', 'Melbourne Chapel St clubs & jazz bars'],
+      nightTipKo: '만 18세 이상 입장 가능. 신분증(여권 원본 등) 지참 필수이며 과음 시 입장 제한(RSA 규정) 적용.',
+      nightTipEn: '18+ entry; valid ID required and strict Responsible Service of Alcohol (RSA) rules apply.',
+    },
+    rulesByPassport: {
+      KR: {
+        whvAvailable: true,
+        visaName: 'Subclass 417',
+        ageRange: '18 - 30세',
+        minAge: 18,
+        maxAge: 30,
+        quotaKo: '인원 제한 없음',
+        quotaEn: 'Uncapped',
+        feeText: 'AUD 650 (기준 변동 가능)',
+        recentlyChanged: true,
+        lastVerifiedAt: '2026-11-20',
+        reqKo: ['만 18~30세 대한민국 여권 소지자', '초기 정착금 약 AUD 5,000 잔고증명', '신체검사 요건 충족'],
+        reqEn: ['Korean passport holder aged 18-30', 'Proof of ~AUD 5,000 funds', 'Health examination if required'],
+        stepsKo: ['ImmiAccount 계정 생성', '온라인 417 비자 신청 및 수수료 결제', '신체검사 후 승인 레터 수령'],
+        stepsEn: ['Create ImmiAccount', 'Submit Subclass 417 online', 'Complete health check & get grant'],
+        travelStatus: 'eta',
+        travelLabelKo: 'ETA 전자허가 (90일)',
+        travelLabelEn: 'ETA Required (90d)',
+        travelFee: 'AUD 20',
+        travelStepsKo: ['Australian ETA 앱 설치', '여권 스캔 및 얼굴 촬영', '수수료 결제 후 즉시 승인'],
+        travelStepsEn: ['Install ETA app', 'Scan passport & selfie', 'Pay fee for instant approval'],
+        travelDocsKo: ['유효기간 6개월 이상 여권', '해외결제 카드'],
+        travelDocsEn: ['Passport (6m+ valid)', 'Payment card'],
+        workVisa: 'SID / TSS 482',
+        workNoteKo: 'IT·간호·기술·외식 전문직 기업 스폰서십 루트 활용 가능',
+        workNoteEn: 'Employer sponsorship available in IT, healthcare, trades & hospitality',
+      },
+      CN: {
+        whvAvailable: true,
+        visaName: 'Subclass 462',
+        ageRange: '18 - 30세',
+        minAge: 18,
+        maxAge: 30,
+        quotaKo: '연간 5,000명 추첨',
+        quotaEn: '5,000 / yr Ballot',
+        feeText: 'AUD 650 (추첨 당첨 후 신청)',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-15',
+        reqKo: ['만 18~30세 중국 여권 소지자', '대학 2년 이상 수료 학력', '영어 성적(IELTS 4.5 이상 등)'],
+        reqEn: ['Chinese citizen aged 18-30', '2+ yrs university study', 'English test (e.g. IELTS 4.5+)'],
+        stepsKo: ['사전 추첨(Ballot) 등록', '당첨 후 온라인 462 비자 접수', '학력·영어·신체검사 서류 제출'],
+        stepsEn: ['Register for Visa Ballot', 'Apply online if selected', 'Submit education, English & health docs'],
+        travelStatus: 'visa',
+        travelLabelKo: '방문비자 (600)',
+        travelLabelEn: 'Visitor Visa 600',
+        travelFee: 'AUD 195',
+        travelStepsKo: ['ImmiAccount 온라인 신청', '재정·재직 증빙 업로드', '생체정보 등록 후 심사'],
+        travelStepsEn: ['Apply via ImmiAccount', 'Upload financial & work proof', 'Complete biometrics'],
+        travelDocsKo: ['여권 사본 및 신분증', '은행 잔고증명', '재직/재학 증명서'],
+        travelDocsEn: ['Passport & ID', 'Bank statement', 'Employment/enrollment proof'],
+        workVisa: 'SID / 186',
+        workNoteKo: '영어 요건 및 경력 충족 시 기업 스폰서십 비자 연계 가능',
+        workNoteEn: 'Employer sponsorship possible with English & skilled experience',
+      },
+      US: {
+        whvAvailable: true,
+        visaName: 'Subclass 462',
+        ageRange: '18 - 30세',
+        minAge: 18,
+        maxAge: 30,
+        quotaKo: '인원 제한 없음',
+        quotaEn: 'Uncapped',
+        feeText: 'AUD 650',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-15',
+        reqKo: ['만 18~30세 미국 여권 소지자', '고등학교 졸업 이상 학력', '초기 정착금 증빙'],
+        reqEn: ['US citizen aged 18-30', 'High school diploma or higher', 'Proof of funds'],
+        stepsKo: ['ImmiAccount 온라인 신청', '학력·재정 서류 첨부', '온라인 승인 통지 수령'],
+        stepsEn: ['Apply via ImmiAccount', 'Attach education & funds proof', 'Receive grant notice'],
+        travelStatus: 'eta',
+        travelLabelKo: 'ETA 전자허가 (90일)',
+        travelLabelEn: 'ETA Required (90d)',
+        travelFee: 'AUD 20',
+        travelStepsKo: ['ETA 앱에서 여권 스캔', '수수료 결제 후 즉시 발급'],
+        travelStepsEn: ['Scan passport in ETA app', 'Pay fee for instant approval'],
+        travelDocsKo: ['유효한 미국 여권'],
+        travelDocsEn: ['Valid US Passport'],
+        workVisa: 'SID / TSS',
+        workNoteKo: '영어 면제 및 전문직 스폰서십 접근성 우수',
+        workNoteEn: 'English exempt with strong skilled sponsorship pathways',
+      },
+    },
+  },
+  {
+    id: 'jp',
+    code: 'JP',
+    countryKo: '일본',
+    countryEn: 'Japan',
+    cityKo: '도쿄 · 오사카',
+    cityEn: 'Tokyo · Osaka',
+    jobsCount: 2380,
+    avgSalaryKo: '연 4,500만 원~',
+    avgSalaryEn: '¥5.0M+ / yr',
+    safetyLevel: 'normal',
+    emergencyNumber: '110 / 119',
+    legalDrinkingAge: 20,
+    newsAlerts: [
+      {
+        tagKo: '유흥가 · 바가지 주의',
+        tagEn: 'Nightlife Caution',
+        titleKo: '도쿄 신주쿠·롯폰기, 오사카 난바 거리 호객꾼 따라가지 말 것 — 과다 청구 사례 주의',
+        titleEn: 'Avoid street touts in Shinjuku, Roppongi & Namba; watch out for inflated bar tabs',
+        date: '2026.11',
+      },
+      {
+        tagKo: '입국 · 결제',
+        tagEn: 'Entry & Payment',
+        titleKo: 'Visit Japan Web 사전 등록 편리 · 일부 로컬 음식점·바는 현금/특정 결제만 지원',
+        titleEn: 'Pre-register on Visit Japan Web; some local spots remain cash-preferred',
+        date: '2026.11',
+      },
+    ],
+    lifestyle: {
+      dayKo: ['시부야 스카이 & 오모테산도 투어', '교토 아라시야마·기온 산책', '오사카 도톤보리 & 우메다 미식'],
+      dayEn: ['Shibuya Sky & Omotesando', 'Kyoto Arashiyama & Gion', 'Osaka Dotonbori food tour'],
+      nightKo: ['신주쿠 골든가이 & 오모이데요코초 심야 바·이자카야', '시부야 라운지 & 뮤직 바', '오사카 신사이바시 클럽 & 칵테일 바'],
+      nightEn: ['Shinjuku Golden Gai & Omoide Yokocho bars', 'Shibuya lounges & music bars', 'Osaka Shinsaibashi clubs & bars'],
+      nightTipKo: '만 20세 이상 음주 가능. 간판·가격표가 명확한 곳만 이용하고 테이블 차지(오토시) 여부 확인.',
+      nightTipEn: 'Drinking age is 20+; choose venues with transparent menus and check cover charges (otoshi).',
+    },
+    rulesByPassport: {
+      KR: {
+        whvAvailable: true,
+        visaName: '워킹홀리데이 (H-1)',
+        ageRange: '18 - 30세',
+        minAge: 18,
+        maxAge: 30,
+        quotaKo: '연 10,000명 (분기별 접수)',
+        quotaEn: '10,000 / yr (Quarterly)',
+        feeText: '무료 (대리신청 수수료 별도)',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-18',
+        reqKo: ['만 18~30세 대한민국 국민', '초기 경비 약 250만 원 잔고증명'],
+        reqEn: ['Korean citizen aged 18-30', 'Proof of ~2.5M KRW funds'],
+        stepsKo: ['대사관 지정 대리신청기관 접수', '이유서·계획서 및 서류 제출', '발표 후 여권 비자 수령'],
+        stepsEn: ['Submit via accredited agency', 'Provide reason & plan docs', 'Collect visa in passport'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 (90일)',
+        travelLabelEn: 'Visa-Free (90d)',
+        travelFee: '무료',
+        travelStepsKo: ['별도 비자 없이 입국', 'Visit Japan Web 세관·입국 입력'],
+        travelStepsEn: ['Enter without prior visa', 'Complete Visit Japan Web'],
+        travelDocsKo: ['유효한 여권', '귀국/제3국 항공권'],
+        travelDocsEn: ['Valid passport', 'Onward/return ticket'],
+        workVisa: '기술·인문지식·국제업무',
+        workNoteKo: 'IT 개발·무역·서비스업 채용 활발',
+        workNoteEn: 'Active hiring in IT, trade & hospitality',
+      },
+      CN: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '중국 여권 워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-18',
+        reqKo: ['중국-일본 워홀 협정 미체결', '취업비자(기인국) 또는 유학비자 경로 활용'],
+        reqEn: ['No WHV agreement with China', 'Use Work Visa (E/H/I) or Student Visa'],
+        stepsKo: ['일본 기업 내정 확보', '재류자격인정증명서(COE) 발급', '주중 일본대사관 비자 신청'],
+        stepsEn: ['Get job offer in Japan', 'Obtain COE via sponsor', 'Apply at embassy/consulate'],
+        travelStatus: 'visa',
+        travelLabelKo: '단기체류 비자 필요',
+        travelLabelEn: 'Tourist Visa Required',
+        travelFee: '대행 수수료 별도',
+        travelStepsKo: ['지정 여행사를 통해 서류 접수', '심사 완료 후 비자 수령'],
+        travelStepsEn: ['Apply via authorized agency', 'Receive visa after review'],
+        travelDocsKo: ['여권·사진', '재정/소득 증빙', '일정표'],
+        travelDocsEn: ['Passport & photo', 'Financial/income proof', 'Itinerary'],
+        workVisa: '기술·인문지식·국제업무',
+        workNoteKo: '일본어 역량 또는 IT 전문 경력 보유 시 취업비자 발급 활발',
+        workNoteEn: 'Strong pathways for IT talent & Japanese speakers',
+      },
+      US: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '미국 여권 워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-18',
+        reqKo: ['미국-일본 워홀 협정 없음', '강사 프로그램 또는 취업비자 이용'],
+        reqEn: ['No US-Japan WHV', 'Use teaching programs or Work Visa'],
+        stepsKo: ['고용주 스폰서십 확보', 'COE 수령 후 영사관 신청'],
+        stepsEn: ['Secure sponsor', 'Receive COE & apply at consulate'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 (90일)',
+        travelLabelEn: 'Visa-Free (90d)',
+        travelFee: '무료',
+        travelStepsKo: ['사전 비자 없이 입국', 'Visit Japan Web QR 등록'],
+        travelStepsEn: ['No prior visa needed', 'Register Visit Japan Web'],
+        travelDocsKo: ['유효한 미국 여권'],
+        travelDocsEn: ['Valid US Passport'],
+        workVisa: 'Engineer / Specialist',
+        workNoteKo: '학사 학위 보유 시 외국계·교육·IT 취업 용이',
+        workNoteEn: 'Bachelor degree supports tech & education roles',
+      },
+    },
+  },
+  {
+    id: 'ca',
+    code: 'CA',
+    countryKo: '캐나다',
+    countryEn: 'Canada',
+    cityKo: '밴쿠버 · 토론토',
+    cityEn: 'Vancouver · Toronto',
+    jobsCount: 980,
+    avgSalaryKo: '연 6,800만 원~',
+    avgSalaryEn: 'CAD 65,000+ / yr',
+    safetyLevel: 'normal',
+    emergencyNumber: '911',
+    legalDrinkingAge: 19,
+    newsAlerts: [
+      {
+        tagKo: '기상 · 도로',
+        tagEn: 'Weather & Roads',
+        titleKo: '서부 해안·산간 지역 우천·강풍·적설 시 도로 통제 발생 — 이동 전 기상·도로 확인',
+        titleEn: 'Check weather & highway advisories during coastal storms or mountain snow',
+        date: '2026.11',
+      },
+      {
+        tagKo: '의료비',
+        tagEn: 'Medical Costs',
+        titleKo: '외국인 병원비 부담이 크므로 체류 전 기간 커버되는 보험 가입 권장',
+        titleEn: 'Out-of-pocket medical care can be costly; maintain travel/WHV insurance',
+        date: '2026.11',
+      },
+    ],
+    lifestyle: {
+      dayKo: ['밴쿠버 스탠리 파크 & 그랜빌 아일랜드', '토론토 CN타워 & 디스틸러리 디스트릭트', '밴프 국립공원 레이크 루이스'],
+      dayEn: ['Vancouver Stanley Park & Granville Island', 'Toronto CN Tower & Distillery District', 'Banff Lake Louise'],
+      nightKo: ['토론토 킹 웨스트 라운지 & 칵테일 바', '밴쿠버 개스타운 크래프트 펍', '몬트리올 크레센트 스트리트 라이브 바'],
+      nightEn: ['Toronto King West lounges & bars', 'Vancouver Gastown craft pubs', 'Montreal Crescent St live venues'],
+      nightTipKo: '주(Province)별 음주 연령 차이(BC·온타리오 만 19세, 퀘벡 만 18세) 및 공공장소 음주 제한 준수.',
+      nightTipEn: 'Drinking age is 19 in BC/ON and 18 in QC; follow local public consumption laws.',
+    },
+    rulesByPassport: {
+      KR: {
+        whvAvailable: true,
+        visaName: 'IEC Working Holiday',
+        ageRange: '18 - 35세',
+        minAge: 18,
+        maxAge: 35,
+        quotaKo: '연 12,000명 (최대 24개월)',
+        quotaEn: '12,000 / yr (Up to 24m)',
+        feeText: 'CAD 272 내외',
+        recentlyChanged: true,
+        lastVerifiedAt: '2026-11-22',
+        reqKo: ['만 18~35세 대한민국 국민', '초기 경비 CAD 2,500', '체류 전 기간 의료보험 가입'],
+        reqEn: ['Korean citizen aged 18-35', 'CAD 2,500 proof of funds', 'Full-stay health insurance'],
+        stepsKo: ['IRCC 풀 등록 및 초청장(ITA) 수령', '서류 업로드 및 수수료 결제', '생체정보(지문) 등록 후 승인'],
+        stepsEn: ['Enter IRCC pool & receive ITA', 'Upload docs & pay fee', 'Complete biometrics for approval'],
+        travelStatus: 'eta',
+        travelLabelKo: 'eTA 전자허가 (6개월)',
+        travelLabelEn: 'eTA Required (6m)',
+        travelFee: 'CAD 7',
+        travelStepsKo: ['Canada.ca 공식 사이트 신청', '여권번호 입력 및 결제 후 승인'],
+        travelStepsEn: ['Apply on Canada.ca', 'Enter passport & pay fee'],
+        travelDocsKo: ['유효한 여권', '결제 카드'],
+        travelDocsEn: ['Valid passport', 'Payment card'],
+        workVisa: 'LMIA / 오픈워크퍼밋',
+        workNoteKo: '현지 경력 축적 후 LMIA·이민 연계 경로 활용 가능',
+        workNoteEn: 'Build local experience toward LMIA or PR pathways',
+      },
+      CN: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '중국 여권 IEC 워홀 미체결',
+        quotaEn: 'No IEC agreement',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-18',
+        reqKo: ['IEC 워홀 대상국 아님', 'LMIA 기반 취업비자 또는 유학 후 취업비자 경로 활용'],
+        reqEn: ['Not eligible for IEC WHV', 'Use LMIA work permit or study pathway'],
+        stepsKo: ['고용주 LMIA 승인 확보', 'IRCC 온라인 워크퍼밋 신청', '생체정보 등록 후 심사'],
+        stepsEn: ['Secure LMIA-backed offer', 'Apply online via IRCC', 'Complete biometrics'],
+        travelStatus: 'visa',
+        travelLabelKo: '방문비자 (TRV)',
+        travelLabelEn: 'Visitor Visa (TRV)',
+        travelFee: 'CAD 100+',
+        travelStepsKo: ['IRCC 온라인 접수', 'VFS 글로벌 지문 등록 후 심사'],
+        travelStepsEn: ['Apply online via IRCC', 'Biometrics at VFS center'],
+        travelDocsKo: ['여권', '재정 증빙', '방문 목적 증빙'],
+        travelDocsEn: ['Passport', 'Financial proof', 'Purpose of visit'],
+        workVisa: 'LMIA Work Permit',
+        workNoteKo: '고용주 LMIA 승인 시 취업비자 신청 가능',
+        workNoteEn: 'Requires employer-backed LMIA approval',
+      },
+      US: {
+        whvAvailable: true,
+        visaName: 'IEC (RO 경유)',
+        ageRange: '18 - 35세',
+        minAge: 18,
+        maxAge: 35,
+        quotaKo: '인정기관(RO) 후원 필수',
+        quotaEn: 'Via Recognized Org',
+        feeText: 'RO 비용 + IRCC 수수료',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-18',
+        reqKo: ['만 18~35세 미국 시민권자', '정부 지정 RO 기관 등록 필수'],
+        reqEn: ['US citizen aged 18-35', 'Must apply through a Recognized Org'],
+        stepsKo: ['지정 RO 기관 후원 확보', 'IRCC 온라인 신청 및 승인'],
+        stepsEn: ['Get RO sponsorship', 'Submit online via IRCC'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 (6개월)',
+        travelLabelEn: 'Visa-Free (6m)',
+        travelFee: '무료',
+        travelStepsKo: ['미국 여권으로 입국 가능'],
+        travelStepsEn: ['Enter with valid US passport'],
+        travelDocsKo: ['유효한 미국 여권'],
+        travelDocsEn: ['Valid US Passport'],
+        workVisa: 'CUSMA Work Permit',
+        workNoteKo: '대상 전문직군 입국 시 국경/항만에서 간소화 절차 가능',
+        workNoteEn: 'Streamlined eligibility for qualifying professionals',
+      },
+    },
+  },
+  {
+    id: 'de',
+    code: 'DE',
+    countryKo: '독일',
+    countryEn: 'Germany',
+    cityKo: '베를린 · 뮌헨',
+    cityEn: 'Berlin · Munich',
+    jobsCount: 1150,
+    avgSalaryKo: '연 7,800만 원~',
+    avgSalaryEn: '€54,000+ / yr',
+    safetyLevel: 'caution',
+    emergencyNumber: '110 / 112',
+    legalDrinkingAge: 18,
+    newsAlerts: [
+      {
+        tagKo: '교통 · 파업',
+        tagEn: 'Transit & Strikes',
+        titleKo: '철도·항공·대중교통 파업 및 집회 발생 시 지연 잦음 — 이동 전 운행 공지 확인',
+        titleEn: 'Watch for rail, aviation & transit disruptions; check live schedules before travel',
+        date: '2026.11',
+      },
+      {
+        tagKo: '소매치기 · 음료 주의',
+        tagEn: 'Pickpockets & Drinks',
+        titleKo: '주요 역·광장·클럽 밀집 구역 소매치기 및 음료 방치 주의',
+        titleEn: 'Stay alert at transit hubs, markets & clubs; never leave drinks unattended',
+        date: '2026.11',
+      },
+    ],
+    lifestyle: {
+      dayKo: ['베를린 박물관 섬 & 이스트 사이드 갤러리', '뮌헨 마리엔 광장 & 영국 정원', '하이델베르크 고성 투어'],
+      dayEn: ['Berlin Museum Island & East Side Gallery', 'Munich Marienplatz & English Garden', 'Heidelberg Castle'],
+      nightKo: ['베를린 크로이츠베르크 · 프리드리히스하인 클럽', '뮌헨 칵테일 바 & 비어홀', '함부르크 장크트파울리 라이브 바'],
+      nightEn: ['Berlin Kreuzberg & Friedrichshain clubs', 'Munich cocktail bars & beer halls', 'Hamburg St. Pauli live venues'],
+      nightTipKo: '유명 클럽은 입장 심사·복장 기준이 까다로울 수 있으며, 낯선 사람이 건네는 음료는 거절.',
+      nightTipEn: 'Club door selection can be strict; decline drinks from strangers and watch belongings.',
+    },
+    rulesByPassport: {
+      KR: {
+        whvAvailable: true,
+        visaName: '독일 워킹홀리데이',
+        ageRange: '18 - 30세',
+        minAge: 18,
+        maxAge: 30,
+        quotaKo: '인원 제한 없음 · 현지 신청 가능',
+        quotaEn: 'Uncapped · In-country OK',
+        feeText: '약 €75 내외',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-19',
+        reqKo: ['만 18~30세 대한민국 국민', '초기 경비 약 €2,000', '독일 현지 유효 의료보험'],
+        reqEn: ['Korean citizen aged 18-30', 'Proof of ~€2,000 funds', 'Valid German health insurance'],
+        stepsKo: ['주한독일대사관 예약 또는 현지 외국인청 접수', '여권·보험·잔고증명 제출', '비자 또는 거주허가 발급'],
+        stepsEn: ['Book embassy or local office', 'Submit passport, insurance & funds', 'Receive visa or residence permit'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 (90일)',
+        travelLabelEn: 'Visa-Free (90d)',
+        travelFee: '무료',
+        travelStepsKo: ['솅겐 180일 중 90일 이내 무비자 체류'],
+        travelStepsEn: ['Up to 90 days in 180 days in Schengen'],
+        travelDocsKo: ['체류 종료일 기준 3개월 이상 유효 여권', '숙소·경비 증빙'],
+        travelDocsEn: ['Passport valid 3m+ past stay', 'Accommodation & funds proof'],
+        workVisa: 'EU 블루카드 / 기회카드',
+        workNoteKo: '한국 국적자는 현지 입국 후 취업비자 신청 루트 활용 가능',
+        workNoteEn: 'Eligible to apply for work residence permits in-country',
+      },
+      CN: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '중국 여권 워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-19',
+        reqKo: ['독일-중국 워홀 협정 미체결', '기회카드(Chancenkarte) 또는 취업비자 경로 활용'],
+        reqEn: ['No WHV agreement', 'Consider Opportunity Card or Work Visa'],
+        stepsKo: ['학력·자격 요건 확인', '주중 독일대사관 비자 신청'],
+        stepsEn: ['Verify qualification rules', 'Apply at German mission in China'],
+        travelStatus: 'visa',
+        travelLabelKo: '솅겐 비자 필요',
+        travelLabelEn: 'Schengen Visa Required',
+        travelFee: '€90',
+        travelStepsKo: ['TLScontact 예약 및 지문 등록', '서류 심사 후 비자 수령'],
+        travelStepsEn: ['Book TLScontact & biometrics', 'Collect visa after review'],
+        travelDocsKo: ['여권', '솅겐 보험(€30,000)', '재정·재직 서류'],
+        travelDocsEn: ['Passport', 'Schengen insurance (€30k)', 'Financial & job docs'],
+        workVisa: 'EU Blue Card / 기회카드',
+        workNoteKo: '학위 및 연봉 기준 충족 시 EU 블루카드 신청 가능',
+        workNoteEn: 'EU Blue Card available with degree & salary threshold',
+      },
+      US: {
+        whvAvailable: false,
+        visaName: '현지 거주·취업허가 활용',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '무비자 입국 후 현지 신청 가능',
+        quotaEn: 'Apply in-country after entry',
+        feeText: '현지 발급 수수료 적용',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-19',
+        reqKo: ['미국 시민권자는 무비자 입국 후 현지 외국인청에서 거주·취업허가 신청 가능'],
+        reqEn: ['US citizens may enter visa-free and apply locally for residence/work permit'],
+        stepsKo: ['독일 입국 및 주소지 등록(Anmeldung)', '고용계약서 등 서류로 현지 신청'],
+        stepsEn: ['Enter & register address', 'Apply locally with contract & docs'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 (90일)',
+        travelLabelEn: 'Visa-Free (90d)',
+        travelFee: '무료',
+        travelStepsKo: ['솅겐 지역 90일 무비자 체류 가능'],
+        travelStepsEn: ['90-day Schengen visa-free stay'],
+        travelDocsKo: ['체류 종료일 기준 3개월 이상 유효 여권'],
+        travelDocsEn: ['Passport valid 3m+ past stay'],
+        workVisa: 'EU Blue Card / 현지전환',
+        workNoteKo: '입국 후 현지 외국인청을 통한 취업비자 전환 가능',
+        workNoteEn: 'Can apply for work permit locally after arrival',
+      },
+    },
+  },
+  {
+    id: 'th',
+    code: 'TH',
+    countryKo: '태국',
+    countryEn: 'Thailand',
+    cityKo: '방콕 · 치앙마이 · 푸켓',
+    cityEn: 'Bangkok · Chiang Mai · Phuket',
+    jobsCount: 860,
+    avgSalaryKo: '연 4,200만 원~',
+    avgSalaryEn: 'THB 1.1M+ / yr',
+    safetyLevel: 'caution',
+    emergencyNumber: '191 / 1669',
+    legalDrinkingAge: 20,
+    newsAlerts: [
+      {
+        tagKo: '치안 · 교통',
+        tagEn: 'Safety & Transit',
+        titleKo: '방콕·파타야·푸켓 주요 관광지 소매치기 및 택시/툭툭 요금 협의 주의',
+        titleEn: 'Watch for pickpockets in tourist hubs & confirm metered/app fares before riding',
+        date: '2026.11',
+      },
+      {
+        tagKo: '주류 · 영업시간',
+        tagEn: 'Alcohol & Hours',
+        titleKo: '주류 판매 제한 시간대 및 심야 유흥구역 영업시간 규정 변동 확인',
+        titleEn: 'Check restricted alcohol retail hours and late-night entertainment zone rules',
+        date: '2026.11',
+      },
+    ],
+    lifestyle: {
+      dayKo: ['방콕 짜오프라야강 사원 & 카페 투어', '치앙마이 올드타운·님만해민 맛집', '푸켓 아일랜드 호핑 & 스노클링'],
+      dayEn: ['Bangkok Chao Phraya temples & cafes', 'Chiang Mai Nimman & old town food', 'Phuket island hopping & snorkeling'],
+      nightKo: ['방콕 통로(Thonglor)·에까마이 라운지 & 루프탑 바', '치앙마이 님만·산티탐 라이브 바', '푸켓 방라 로드·비치 클럽 라운지'],
+      nightEn: ['Bangkok Thonglor & Ekkamai lounges/bars', 'Chiang Mai live music bars', 'Phuket beach clubs & evening bars'],
+      nightTipKo: '만 20세 이상 입장. 정식 허가 업소만 이용하고 낯선 사람이 건네는 음료·담배는 거절.',
+      nightTipEn: '20+ entry; stick to licensed venues and never accept drinks or items from strangers.',
+    },
+    rulesByPassport: {
+      KR: {
+        whvAvailable: false,
+        visaName: '워홀 협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '별도 워킹홀리데이 협정 없음',
+        quotaEn: 'No bilateral WHV program',
+        feeText: '비자 유형별 상이',
+        recentlyChanged: true,
+        lastVerifiedAt: '2026-11-24',
+        reqKo: ['단기 체류·원격근무(DTV) 등 목적별 최신 요건 확인', '현지 취업 시 워크퍼밋(WP) 및 비즈니스 비자 필수'],
+        reqEn: ['Check current short-stay or DTV rules', 'Work permit & Non-B visa required for local jobs'],
+        stepsKo: ['체류 목적(관광·장기체류·취업) 확정', '공식 전자비자/대사관 절차 확인 후 신청'],
+        stepsEn: ['Confirm stay purpose', 'Apply via official e-Visa/embassy channel'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 단기체류 가능',
+        travelLabelEn: 'Visa-Free Short Stay',
+        travelFee: '무료',
+        travelStepsKo: ['유효 여권 지참 후 입국', '입국 신고/전자입국 요건 사전 점검'],
+        travelStepsEn: ['Enter with valid passport', 'Verify current arrival card/digital entry rules'],
+        travelDocsKo: ['유효기간 6개월 이상 여권', '출국 항공권 및 숙소 정보'],
+        travelDocsEn: ['Passport (6m+ valid)', 'Onward ticket & stay details'],
+        workVisa: 'Non-B + Work Permit',
+        workNoteKo: '관광·무역·IT·외국계 법인 채용 시 고용주 스폰서십으로 워크퍼밋 발급',
+        workNoteEn: 'Requires employer sponsorship for Non-B visa and work permit',
+      },
+      CN: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '-',
+        recentlyChanged: true,
+        lastVerifiedAt: '2026-11-24',
+        reqKo: ['단기 체류 협정 여부 및 취업 시 워크퍼밋 요건 확인'],
+        reqEn: ['Verify short-stay visa rules; work permit required for employment'],
+        stepsKo: ['체류 목적별 최신 입국 규정 확인', '취업 시 현지 기업 워크퍼밋 절차 진행'],
+        stepsEn: ['Check latest entry rules for stay type', 'Complete work permit process with employer'],
+        travelStatus: 'free',
+        travelLabelKo: '상호 무비자 체류 협정',
+        travelLabelEn: 'Mutual Visa-Free Stay',
+        travelFee: '무료',
+        travelStepsKo: ['유효 여권으로 입국 가능 여부 확인', '왕복 항공권·체류 증빙 지참'],
+        travelStepsEn: ['Verify visa-free stay duration', 'Carry return ticket & proof of stay'],
+        travelDocsKo: ['유효 여권', '항공권 및 숙소 예약내역'],
+        travelDocsEn: ['Valid passport', 'Flight & hotel confirmation'],
+        workVisa: 'Non-B + Work Permit',
+        workNoteKo: '합법 근로 시 고용주 명의 워크퍼밋 발급 필수',
+        workNoteEn: 'Employer-sponsored work permit mandatory for local work',
+      },
+      US: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-20',
+        reqKo: ['단기 체류 후 현지 취업 시 워크퍼밋 및 비자 전환 필요'],
+        reqEn: ['Work permit & appropriate visa required if taking local employment'],
+        stepsKo: ['입국 목적 확인', '현지 취업 시 스폰서 기업 통해 비자·워크퍼밋 진행'],
+        stepsEn: ['Confirm entry purpose', 'Process work visa & permit via sponsoring employer'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 단기체류 가능',
+        travelLabelEn: 'Visa-Free Short Stay',
+        travelFee: '무료',
+        travelStepsKo: ['유효한 미국 여권 지참 후 입국'],
+        travelStepsEn: ['Enter with valid US passport'],
+        travelDocsKo: ['유효기간 6개월 이상 여권', '출국 항공권'],
+        travelDocsEn: ['Passport (6m+ valid)', 'Onward ticket'],
+        workVisa: 'Non-B / Treaty of Amity',
+        workNoteKo: '미·태 우호조약 관련 기업 구조 및 워크퍼밋 요건 확인',
+        workNoteEn: 'Check Treaty of Amity structures and work permit requirements',
+      },
+    },
+  },
+  {
+    id: 'vn',
+    code: 'VN',
+    countryKo: '베트남',
+    countryEn: 'Vietnam',
+    cityKo: '호치민 · 하노이 · 다낭',
+    cityEn: 'Ho Chi Minh · Hanoi · Da Nang',
+    jobsCount: 910,
+    avgSalaryKo: '연 3,600만 원~',
+    avgSalaryEn: 'VND 650M+ / yr',
+    safetyLevel: 'caution',
+    emergencyNumber: '113 / 115',
+    legalDrinkingAge: 18,
+    newsAlerts: [
+      {
+        tagKo: '치안 · 소지품',
+        tagEn: 'Street Safety',
+        titleKo: '호치민·하노이·다낭 도로변 오토바이 날치기·소매치기 주의 — 스마트폰 도로쪽 사용 자제',
+        titleEn: 'Watch for motorbike bag/phone snatching near roads; keep phones away from street side',
+        date: '2026.11',
+      },
+      {
+        tagKo: '체류 · 근로',
+        tagEn: 'Visa & Work',
+        titleKo: '무비자 체류 일수 초과(오버스테이) 벌금 엄격 · 현지 근무 시 워크퍼밋(TRC) 필수',
+        titleEn: 'Strict overstay penalties; valid Work Permit / Temporary Residence Card required to work',
+        date: '2026.11',
+      },
+    ],
+    lifestyle: {
+      dayKo: ['호치민 1군 카페·역사 탐방', '하노이 구시가지·호안끼엠 산책', '다낭·호이안 해변 및 야시장 투어'],
+      dayEn: ['HCMC District 1 cafes & heritage', 'Hanoi Old Quarter & Hoan Kiem', 'Da Nang & Hoi An coast'],
+      nightKo: ['호치민 1군·타오디엔 루프탑 바 & 칵테일 라운지', '하노이 트라리·타이호 뷰 바 & 펍', '다낭 한강변 루프탑 라운지 & 비치 바'],
+      nightEn: ['HCMC District 1 & Thao Dien rooftop bars', 'Hanoi Tay Ho & central lounges', 'Da Nang Han River lounges & bars'],
+      nightTipKo: '만 18세 이상 음주 가능. 심야 이동 시 검증된 호출 앱(Grab 등)을 이용하고 현금·귀중품 분산 보관.',
+      nightTipEn: '18+ drinking age; use trusted ride-hailing apps late at night and keep valuables secure.',
+    },
+    rulesByPassport: {
+      KR: {
+        whvAvailable: false,
+        visaName: '워홀 협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-21',
+        reqKo: ['단기 체류 기간 초과 시 전자비자(e-Visa) 또는 체류비자 확인', '취업 시 현지 워크퍼밋·임시거주증(TRC) 필요'],
+        reqEn: ['Use e-Visa if staying beyond visa-free window; Work Permit & TRC required for jobs'],
+        stepsKo: ['체류 기간 및 목적 확인', '장기 체류/근무 시 고용주 또는 공식 포털 통해 비자 진행'],
+        stepsEn: ['Check stay length & purpose', 'Process e-Visa or employer work permit as needed'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 단기체류 가능',
+        travelLabelEn: 'Visa-Free Short Stay',
+        travelFee: '무료 (e-Visa 별도)',
+        travelStepsKo: ['유효 여권 지참 후 입국', '체류 일수 초과 시 사전에 전자비자 신청'],
+        travelStepsEn: ['Enter with valid passport', 'Apply for e-Visa if exceeding visa-free days'],
+        travelDocsKo: ['유효기간 6개월 이상 여권', '항공권 및 숙소 정보'],
+        travelDocsEn: ['Passport (6m+ valid)', 'Flight & accommodation info'],
+        workVisa: 'LD / DN Work Permit',
+        workNoteKo: '제조·IT·무역·서비스 법인 채용 시 학력/경력 증빙 후 워크퍼밋 발급',
+        workNoteEn: 'Work permit issued with qualifying degree/experience & company sponsor',
+      },
+      CN: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: 'e-Visa 수수료 적용',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-21',
+        reqKo: ['입국 전 전자비자(e-Visa) 또는 목적별 비자 사전 발급 확인'],
+        reqEn: ['Confirm e-Visa or appropriate visa prior to travel'],
+        stepsKo: ['베트남 공식 e-Visa 포털 신청', '승인 레터 출력 후 입국'],
+        stepsEn: ['Apply via official e-Visa portal', 'Print approval letter for entry'],
+        travelStatus: 'visa',
+        travelLabelKo: '전자비자(e-Visa) 필요',
+        travelLabelEn: 'e-Visa Required',
+        travelFee: 'USD 25 내외',
+        travelStepsKo: ['공식 전자비자 사이트에서 여권·사진 업로드', '결제 후 e-Visa 승인서 발급'],
+        travelStepsEn: ['Upload passport & photo on e-Visa site', 'Pay fee and download approval'],
+        travelDocsKo: ['여권(유효기간 6개월 이상)', '정면 사진 및 결제 카드'],
+        travelDocsEn: ['Passport (6m+ valid)', 'Portrait photo & card'],
+        workVisa: 'LD / Work Permit',
+        workNoteKo: '고용주 스폰서십 및 워크퍼밋 요건 충족 시 근로 가능',
+        workNoteEn: 'Requires employer sponsorship and work permit approval',
+      },
+      US: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: 'e-Visa 수수료 적용',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-21',
+        reqKo: ['전자비자(e-Visa) 발급 후 입국, 취업 시 워크퍼밋 필요'],
+        reqEn: ['Obtain e-Visa before arrival; work permit required for employment'],
+        stepsKo: ['공식 e-Visa 신청', '승인 후 입국 및 현지 취업 시 워크퍼밋 진행'],
+        stepsEn: ['Submit e-Visa online', 'Enter and complete work permit if employed locally'],
+        travelStatus: 'visa',
+        travelLabelKo: '전자비자(e-Visa) 필요',
+        travelLabelEn: 'e-Visa Required',
+        travelFee: 'USD 25 내외',
+        travelStepsKo: ['온라인 e-Visa 신청 및 결제', '승인 서류 지참 후 입국'],
+        travelStepsEn: ['Apply & pay online for e-Visa', 'Carry approval for entry'],
+        travelDocsKo: ['유효기간 6개월 이상 미국 여권', '결제 카드'],
+        travelDocsEn: ['US Passport (6m+ valid)', 'Payment card'],
+        workVisa: 'LD / Work Permit',
+        workNoteKo: '고용주 스폰서십 및 자격 요건 충족 시 워크퍼밋 발급',
+        workNoteEn: 'Work permit issued with employer sponsor & qualifications',
+      },
+    },
+  },
+  {
+    id: 'ph',
+    code: 'PH',
+    countryKo: '필리핀',
+    countryEn: 'Philippines',
+    cityKo: '마닐라 · 세부 · 보라카이',
+    cityEn: 'Manila · Cebu · Boracay',
+    jobsCount: 540,
+    avgSalaryKo: '연 3,200만 원~',
+    avgSalaryEn: 'PHP 1.1M+ / yr',
+    safetyLevel: 'caution',
+    emergencyNumber: '911',
+    legalDrinkingAge: 18,
+    newsAlerts: [
+      {
+        tagKo: '치안 · 이동',
+        tagEn: 'Travel Safety',
+        titleKo: '마닐라·세부 도심 야간 외곽 이동 자제 — 검증된 차량 호출 앱·호텔 연계 차량 이용 권장',
+        titleEn: 'Avoid unfamiliar areas late at night; use trusted ride apps or vetted hotel transport',
+        date: '2026.11',
+      },
+      {
+        tagKo: '기상 · 해상',
+        tagEn: 'Weather & Marine',
+        titleKo: '열대성 스콜·태풍 시즌 페리/보트 운항 변동 잦음 — 당일 해양 기상 공지 확인',
+        titleEn: 'Check marine advisories for ferry/island trips during tropical rain or storm periods',
+        date: '2026.11',
+      },
+    ],
+    lifestyle: {
+      dayKo: ['세부·보라카이 호핑투어 & 다이빙', '마닐라 BGC(보니파시오) 모던 카페·갤러리 투어', '선셋 세일링 & 로컬 해산물 미식'],
+      dayEn: ['Cebu & Boracay island hopping & diving', 'Manila BGC cafes & modern districts', 'Sunset sailing & seafood'],
+      nightKo: ['마닐라 BGC 루프탑 바 & 칵테일 라운지', '세부 IT파크·도심 라운지 & 펍', '보라카이 화이트비치 선셋·나이트 바'],
+      nightEn: ['Manila BGC rooftop bars & lounges', 'Cebu IT Park & city lounges', 'Boracay beachfront evening bars'],
+      nightTipKo: '만 18세 이상 입장. 계산서 금액을 즉시 확인하고, 인적이 드문 골목이나 일면식 없는 동행 유도에 주의.',
+      nightTipEn: '18+ entry; verify bills promptly and stay in well-lit, established venues.',
+    },
+    rulesByPassport: {
+      KR: {
+        whvAvailable: false,
+        visaName: '워홀 협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '체류 연장/비자별 상이',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-22',
+        reqKo: ['단기 무비자 체류 기간 이후 장기 체류 시 이민국 연장(ACR I-Card 등) 확인', '현지 근로 시 AEP/취업비자 필수'],
+        reqEn: ['Extend via Immigration if staying longer; AEP & work visa required for employment'],
+        stepsKo: ['입국 항공권 및 체류 일정 확인', '장기 체류/근무 시 이민국(BI)·노동부(DOLE) 절차 진행'],
+        stepsEn: ['Confirm return/onward ticket', 'Follow BI/DOLE steps for long stay or work'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 단기체류 가능',
+        travelLabelEn: 'Visa-Free Short Stay',
+        travelFee: '무료',
+        travelStepsKo: ['유효 여권 및 출국 항공권 지참 후 입국', '전자입국등록(eTravel) 요건 확인'],
+        travelStepsEn: ['Enter with valid passport & onward ticket', 'Check eTravel registration requirements'],
+        travelDocsKo: ['유효기간 6개월 이상 여권', '출국 항공권'],
+        travelDocsEn: ['Passport (6m+ valid)', 'Onward ticket'],
+        workVisa: '9G Work Visa / AEP',
+        workNoteKo: '현지 법인 채용 시 노동고용허가(AEP) 및 9G 취업비자 진행',
+        workNoteEn: 'Requires Alien Employment Permit (AEP) and 9G work visa',
+      },
+      CN: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '비자 유형별 상이',
+        recentlyChanged: true,
+        lastVerifiedAt: '2026-11-24',
+        reqKo: ['입국 전 최신 방문비자(9A 등) 발급 규정 및 서류 요건 확인'],
+        reqEn: ['Verify current 9A visitor visa eligibility and required documents before travel'],
+        stepsKo: ['관할 대사관/영사관 최신 비자 요건 확인', '신청서 및 증빙 서류 제출 후 심사'],
+        stepsEn: ['Check latest consulate visa rules', 'Submit application & supporting documents'],
+        travelStatus: 'visa',
+        travelLabelKo: '사전 비자 요건 확인 필요',
+        travelLabelEn: 'Check Pre-Entry Visa',
+        travelFee: '공관 안내 기준',
+        travelStepsKo: ['입국 전 최신 비자 발급 필요 여부 확인', '필요 시 지정 공관 접수 후 입국'],
+        travelStepsEn: ['Confirm pre-entry visa requirement', 'Apply at designated mission if required'],
+        travelDocsKo: ['유효 여권', '항공권 및 체류·재정 증빙'],
+        travelDocsEn: ['Valid passport', 'Flight & stay/financial proof'],
+        workVisa: '9G Work Visa / AEP',
+        workNoteKo: '고용주 스폰서십 및 AEP/9G 비자 절차 필요',
+        workNoteEn: 'Requires employer sponsorship, AEP & 9G visa',
+      },
+      US: {
+        whvAvailable: false,
+        visaName: '협정 미체결',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: '워홀 협정 없음',
+        quotaEn: 'No WHV agreement',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-22',
+        reqKo: ['단기 무비자 입국 가능, 장기 체류·근로 시 이민국/노동부 절차 확인'],
+        reqEn: ['Visa-free short entry; follow BI/DOLE rules for extended stay or work'],
+        stepsKo: ['유효 여권 및 출국 항공권 지참', '장기 체류/취업 시 비자 절차 진행'],
+        stepsEn: ['Carry valid passport & onward ticket', 'Process required visa if staying/working long-term'],
+        travelStatus: 'free',
+        travelLabelKo: '무비자 단기체류 가능',
+        travelLabelEn: 'Visa-Free Short Stay',
+        travelFee: '무료',
+        travelStepsKo: ['유효 여권 및 출국 항공권 지참 후 입국'],
+        travelStepsEn: ['Enter with valid passport & onward ticket'],
+        travelDocsKo: ['유효기간 6개월 이상 미국 여권', '출국 항공권'],
+        travelDocsEn: ['US Passport (6m+ valid)', 'Onward ticket'],
+        workVisa: '9G Work Visa / AEP',
+        workNoteKo: '현지 취업 시 스폰서 기업 통해 AEP 및 9G 비자 진행',
+        workNoteEn: 'Processed via sponsoring employer (AEP + 9G)',
+      },
+    },
+  },
+  {
+    id: 'uk',
+    code: 'UK',
+    countryKo: '영국',
+    countryEn: 'United Kingdom',
+    cityKo: '런던 · 에든버러 · 맨체스터',
+    cityEn: 'London · Edinburgh · Manchester',
+    jobsCount: 1640,
+    avgSalaryKo: '연 7,900만 원~',
+    avgSalaryEn: '£44,000+ / yr',
+    safetyLevel: 'normal',
+    emergencyNumber: '999',
+    legalDrinkingAge: 18,
+    newsAlerts: [
+      {
+        tagKo: '입국 · 전자허가',
+        tagEn: 'ETA & Entry',
+        titleKo: '국적별 전자여행허가(ETA) 적용 대상 및 입국 심사 규칙 사전 확인 필수',
+        titleEn: 'Verify ETA requirements and border rules for your nationality prior to departure',
+        date: '2026.11',
+      },
+      {
+        tagKo: '치안 · 소지품',
+        tagEn: 'Urban Safety',
+        titleKo: '런던 번화가·지하철역 주변 스마트폰 날치기·소매치기 주의',
+        titleEn: 'Stay alert for phone snatches & pickpockets in central London and transit hubs',
+        date: '2026.11',
+      },
+    ],
+    lifestyle: {
+      dayKo: ['런던 사우스뱅크·박물관·소호 산책', '에든버러 구시가지·아서스 시트 트레킹', '맨체스터 노던 쿼터 독립 카페·갤러리'],
+      dayEn: ['London South Bank, museums & Soho', 'Edinburgh Old Town & Arthur’s Seat', 'Manchester Northern Quarter'],
+      nightKo: ['소호(Soho)·쇼디치(Shoreditch) 칵테일 바 & 펍', '에든버러 로열 마일·위스키 바', '맨체스터 라이브 뮤직 클럽 & 바'],
+      nightEn: ['Soho & Shoreditch cocktail bars and pubs', 'Edinburgh whisky & evening bars', 'Manchester live music venues & bars'],
+      nightTipKo: '만 18세 이상 음주 가능. 대중교통 막차 시간 확인 및 심야 귀가 시 공식 택시·호출 앱 활용.',
+      nightTipEn: '18+ drinking age; check last train times and use licensed taxis or ride apps late at night.',
+    },
+    rulesByPassport: {
+      KR: {
+        whvAvailable: true,
+        visaName: 'YMS (Youth Mobility)',
+        ageRange: '18 - 30세',
+        minAge: 18,
+        maxAge: 30,
+        quotaKo: '연간 쿼터 추첨/발표 방식 확인',
+        quotaEn: 'Check annual ballot/quota schedule',
+        feeText: '비자 신청료 + IHS 건강부담금',
+        recentlyChanged: true,
+        lastVerifiedAt: '2026-11-25',
+        reqKo: ['만 18~30세 대한민국 여권 소지자', '재정 증빙(약 £2,530 기준 요건 확인)', '비자 신청료 및 IHS(건강보험료) 납부'],
+        reqEn: ['Korean passport holder aged 18-30', 'Financial maintenance proof (~£2,530 benchmark)', 'Visa fee & Immigration Health Surcharge (IHS)'],
+        stepsKo: ['YMS 신청 기간·추첨 여부 확인', 'GOV.UK 온라인 신청 및 수수료/IHS 결제', '비자센터 생체정보·여권 제출 후 승인'],
+        stepsEn: ['Check YMS ballot/application window', 'Apply on GOV.UK & pay fee + IHS', 'Complete biometrics & receive decision'],
+        travelStatus: 'eta',
+        travelLabelKo: 'ETA 전자허가 확인 필요',
+        travelLabelEn: 'ETA Check Required',
+        travelFee: 'GOV.UK 공시 기준',
+        travelStepsKo: ['GOV.UK 또는 공식 ETA 앱에서 신청 여부 확인', '여권 스캔·얼굴 촬영 및 결제 후 승인'],
+        travelStepsEn: ['Check eligibility on GOV.UK / ETA app', 'Scan passport, selfie & pay for approval'],
+        travelDocsKo: ['유효한 대한민국 여권', '해외결제 카드'],
+        travelDocsEn: ['Valid Korean passport', 'Payment card'],
+        workVisa: 'Skilled Worker Visa',
+        workNoteKo: '스폰서 라이선스 보유 기업 잡오퍼 확보 시 숙련직 취업비자 가능',
+        workNoteEn: 'Requires job offer from a licensed UK sponsor for Skilled Worker visa',
+      },
+      CN: {
+        whvAvailable: false,
+        visaName: 'YMS 대상국 아님 (취업/학업 비자 활용)',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: 'YMS 대상국 아님',
+        quotaEn: 'Not on YMS eligible list',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-20',
+        reqKo: ['Skilled Worker 비자 또는 학업·연구 경로 활용'],
+        reqEn: ['Use Skilled Worker visa or eligible study/graduate pathways'],
+        stepsKo: ['스폰서 기업 잡오퍼 또는 교육기관 입학 허가 확보', 'GOV.UK 온라인 신청 및 생체정보 등록'],
+        stepsEn: ['Secure sponsor job offer or CAS', 'Apply online via GOV.UK & complete biometrics'],
+        travelStatus: 'visa',
+        travelLabelKo: '방문비자 사전 신청 필요',
+        travelLabelEn: 'Standard Visitor Visa',
+        travelFee: 'GOV.UK 공시 기준',
+        travelStepsKo: ['GOV.UK 온라인 신청서 작성 및 수수료 결제', '비자센터 방문하여 지문·사진 및 서류 제출'],
+        travelStepsEn: ['Complete GOV.UK form & pay fee', 'Attend visa center for biometrics & docs'],
+        travelDocsKo: ['여권', '재정·체류 증빙 서류', '영문 번역 증빙'],
+        travelDocsEn: ['Passport', 'Financial & travel proof', 'Certified translations if needed'],
+        workVisa: 'Skilled Worker Visa',
+        workNoteKo: '인증 스폰서 고용주의 잡오퍼 및 급여·기술 요건 충족 시 신청',
+        workNoteEn: 'Requires licensed sponsor job offer meeting skill & salary thresholds',
+      },
+      US: {
+        whvAvailable: false,
+        visaName: 'YMS 대상국 아님 (취업비자 활용)',
+        ageRange: '-',
+        minAge: 0,
+        maxAge: 0,
+        quotaKo: 'YMS 대상국 아님',
+        quotaEn: 'Not on YMS eligible list',
+        feeText: '-',
+        recentlyChanged: false,
+        lastVerifiedAt: '2026-11-20',
+        reqKo: ['현지 취업 시 스폰서 기업 잡오퍼 기반 Skilled Worker 비자 신청'],
+        reqEn: ['Skilled Worker visa required with a licensed UK employer sponsor'],
+        stepsKo: ['스폰서 잡오퍼 확보', 'GOV.UK 온라인 신청 및 생체정보 등록'],
+        stepsEn: ['Obtain licensed sponsor offer', 'Submit online on GOV.UK & do biometrics'],
+        travelStatus: 'eta',
+        travelLabelKo: 'ETA 전자허가 확인 필요',
+        travelLabelEn: 'ETA Check Required',
+        travelFee: 'GOV.UK 공시 기준',
+        travelStepsKo: ['출국 전 GOV.UK 또는 공식 ETA 앱으로 신청', '승인 후 유효 여권으로 입국'],
+        travelStepsEn: ['Apply via GOV.UK or ETA app before travel', 'Travel with approved ETA & valid US passport'],
+        travelDocsKo: ['유효한 미국 여권', '결제 카드'],
+        travelDocsEn: ['Valid US Passport', 'Payment card'],
+        workVisa: 'Skilled Worker Visa',
+        workNoteKo: '스폰서 기업 잡오퍼 확보 시 취업비자 신청 가능',
+        workNoteEn: 'Eligible with a qualifying job offer from a licensed sponsor',
+      },
+    },
+  },
+];
+
+const INITIAL_REVIEWS: FieldReview[] = [
+  {
+    id: 'rev-1',
+    countryId: 'jp',
+    passportCode: 'KR',
+    category: 'nightlife',
+    summary: '골든가이는 분위기 좋았지만 호객꾼 따라간 곳은 자릿세 안내가 달랐음. 메뉴판·가격 명확한 곳만 이용 추천.',
+    createdAtMs: Date.now() - 1000 * 60 * 60 * 48,
+    createdAtLabelKo: '2일 전',
+    createdAtLabelEn: '2d ago',
+    helpfulCount: 19,
+    outdatedCount: 1,
+  },
+  {
+    id: 'rev-2',
+    countryId: 'au',
+    passportCode: 'KR',
+    category: 'visa',
+    summary: 'ETA 앱으로 신청 후 빠르게 승인됨. 입국 시 간식·식품류는 무조건 세관 신고서에 체크하는 게 안전.',
+    createdAtMs: Date.now() - 1000 * 60 * 60 * 24 * 5,
+    createdAtLabelKo: '5일 전',
+    createdAtLabelEn: '5d ago',
+    helpfulCount: 25,
+    outdatedCount: 0,
+  },
+  {
+    id: 'rev-3',
+    countryId: 'de',
+    passportCode: 'KR',
+    category: 'safety',
+    summary: '대중교통 파업·지연 공지가 잦아서 공항·기차 이동 시 넉넉한 시간 확보가 필수였음.',
+    createdAtMs: Date.now() - 1000 * 60 * 60 * 24 * 8,
+    createdAtLabelKo: '8일 전',
+    createdAtLabelEn: '8d ago',
+    helpfulCount: 14,
+    outdatedCount: 1,
+  },
+  {
+    id: 'rev-th-1',
+    countryId: 'th',
+    passportCode: 'KR',
+    category: 'nightlife',
+    summary: '방콕 통로/에까마이 라운지는 가격과 동선이 깔끔했고, 이동은 호출 앱을 쓰니 훨씬 편했음.',
+    createdAtMs: Date.now() - 1000 * 60 * 60 * 24 * 3,
+    createdAtLabelKo: '3일 전',
+    createdAtLabelEn: '3d ago',
+    helpfulCount: 15,
+    outdatedCount: 0,
+  },
+  {
+    id: 'rev-vn-1',
+    countryId: 'vn',
+    passportCode: 'KR',
+    category: 'safety',
+    summary: '호치민·다낭 도보 이동 시 가방과 휴대폰은 차도 반대쪽으로 들고 다니는 습관이 확실히 도움됨.',
+    createdAtMs: Date.now() - 1000 * 60 * 60 * 24 * 4,
+    createdAtLabelKo: '4일 전',
+    createdAtLabelEn: '4d ago',
+    helpfulCount: 17,
+    outdatedCount: 0,
+  },
+  {
+    id: 'rev-ph-1',
+    countryId: 'ph',
+    passportCode: 'KR',
+    category: 'safety',
+    summary: '세부·마닐라 심야 이동은 호출 앱이나 숙소 연계 차량을 이용하고, 계산서 금액은 바로 확인하는 게 좋음.',
+    createdAtMs: Date.now() - 1000 * 60 * 60 * 24 * 6,
+    createdAtLabelKo: '6일 전',
+    createdAtLabelEn: '6d ago',
+    helpfulCount: 13,
+    outdatedCount: 0,
+  },
+  {
+    id: 'rev-uk-1',
+    countryId: 'uk',
+    passportCode: 'KR',
+    category: 'visa',
+    summary: '영국 YMS·ETA 신청 전 GOV.UK 공식 안내에서 최신 수수료와 서류 조건을 한 번 더 대조하는 게 안전.',
+    createdAtMs: Date.now() - 1000 * 60 * 60 * 24 * 2,
+    createdAtLabelKo: '2일 전',
+    createdAtLabelEn: '2d ago',
+    helpfulCount: 21,
+    outdatedCount: 0,
+  },
+];
+
+const JOB_LISTINGS = [
+  {
+    id: 'job-1',
+    countryId: 'au',
+    company: 'Atlassian Sydney',
+    titleKo: '프론트엔드 엔지니어 (비자 스폰서십 지원)',
+    titleEn: 'Frontend Engineer (Visa Sponsorship)',
+    locationKo: '호주 시드니 · 하이브리드',
+    locationEn: 'Sydney, AU · Hybrid',
+    salaryKo: '연 1.2억 원 (AUD 135,000)',
+    salaryEn: 'AUD 135,000 / yr',
+    visaSupport: true,
+    langReqKo: '영어 업무 가능',
+    langReqEn: 'Business English',
+    experienceKo: '경력 2년↑',
+    experienceEn: '2+ yrs',
+    dDay: 'D-9',
+    badgeColor: 'bg-blue-600',
+  },
+  {
+    id: 'job-2',
+    countryId: 'jp',
+    company: 'Rakuten Group',
+    titleKo: '글로벌 프로덕트 매니저 (영어 트랙)',
+    titleEn: 'Global Product Manager (English Track)',
+    locationKo: '일본 도쿄 세타가야구',
+    locationEn: 'Tokyo, JP · On-site',
+    salaryKo: '연 6,500만 원 (¥7.2M)',
+    salaryEn: '¥7,200,000 / yr',
+    visaSupport: true,
+    langReqKo: '영어 가능 (일본어 무관)',
+    langReqEn: 'English OK',
+    experienceKo: '신입 · 경력',
+    experienceEn: 'Entry / Mid',
+    dDay: 'D-5',
+    badgeColor: 'bg-rose-600',
+  },
+  {
+    id: 'job-3',
+    countryId: 'ca',
+    company: 'Shopify Vancouver',
+    titleKo: '커머스 데이터 애널리스트 (IEC / 오픈퍼밋 환영)',
+    titleEn: 'Commerce Data Analyst (IEC / Open Permit)',
+    locationKo: '캐나다 밴쿠버 · 원격 혼합',
+    locationEn: 'Vancouver, CA · Hybrid',
+    salaryKo: '연 9,200만 원 (CAD 95,000)',
+    salaryEn: 'CAD 95,000 / yr',
+    visaSupport: true,
+    langReqKo: '영어 일상·업무 가능',
+    langReqEn: 'Conversational English',
+    experienceKo: '경력 1년↑',
+    experienceEn: '1+ yr',
+    dDay: 'D-14',
+    badgeColor: 'bg-emerald-600',
+  },
+  {
+    id: 'job-4',
+    countryId: 'de',
+    company: 'Zalando Berlin',
+    titleKo: 'UI/UX 프로덕트 디자이너 (이주 지원)',
+    titleEn: 'Product Designer (Relocation)',
+    locationKo: '독일 베를린 프리드리히스하인',
+    locationEn: 'Berlin, DE · Hybrid',
+    salaryKo: '연 9,800만 원 (€68,000)',
+    salaryEn: '€68,000 / yr',
+    visaSupport: true,
+    langReqKo: '영어 업무 언어',
+    langReqEn: 'English Working Lang',
+    experienceKo: '경력 2년↑',
+    experienceEn: '2+ yrs',
+    dDay: 'D-11',
+    badgeColor: 'bg-orange-600',
+  },
+  {
+    id: 'job-5',
+    countryId: 'th',
+    company: 'Agoda Bangkok',
+    titleKo: '글로벌 파트너십 어소시에이트 (워크퍼밋 지원)',
+    titleEn: 'Global Partnerships Associate (WP Support)',
+    locationKo: '태국 방콕 · 하이브리드',
+    locationEn: 'Bangkok, TH · Hybrid',
+    salaryKo: '연 4,800만 원~',
+    salaryEn: 'THB 1.2M+ / yr',
+    visaSupport: true,
+    langReqKo: '영어 비즈니스 회화',
+    langReqEn: 'Business English',
+    experienceKo: '경력 1년↑',
+    experienceEn: '1+ yr',
+    dDay: 'D-7',
+    badgeColor: 'bg-teal-600',
+  },
+  {
+    id: 'job-6',
+    countryId: 'vn',
+    company: 'VNG Ho Chi Minh',
+    titleKo: '플랫폼 프로덕트 오너 (워크퍼밋 지원)',
+    titleEn: 'Platform Product Owner (Work Permit)',
+    locationKo: '베트남 호치민 · 온사이트',
+    locationEn: 'Ho Chi Minh, VN · On-site',
+    salaryKo: '연 4,400만 원~',
+    salaryEn: 'VND 780M+ / yr',
+    visaSupport: true,
+    langReqKo: '영어 업무 가능',
+    langReqEn: 'English Working Lang',
+    experienceKo: '경력 2년↑',
+    experienceEn: '2+ yrs',
+    dDay: 'D-12',
+    badgeColor: 'bg-cyan-700',
+  },
+  {
+    id: 'job-7',
+    countryId: 'ph',
+    company: 'GCash Manila (Mynt)',
+    titleKo: '모바일 서비스 리스크 애널리스트 (9G 비자 지원)',
+    titleEn: 'Mobile Risk Analyst (9G Visa Support)',
+    locationKo: '필리핀 마닐라 BGC · 하이브리드',
+    locationEn: 'BGC Manila, PH · Hybrid',
+    salaryKo: '연 3,900만 원~',
+    salaryEn: 'PHP 1.3M+ / yr',
+    visaSupport: true,
+    langReqKo: '영어 업무 가능',
+    langReqEn: 'Business English',
+    experienceKo: '경력 1년↑',
+    experienceEn: '1+ yr',
+    dDay: 'D-8',
+    badgeColor: 'bg-sky-700',
+  },
+  {
+    id: 'job-8',
+    countryId: 'uk',
+    company: 'Monzo Bank London',
+    titleKo: '백엔드 엔지니어 (Skilled Worker 스폰서십)',
+    titleEn: 'Backend Engineer (Skilled Worker Sponsor)',
+    locationKo: '영국 런던 · 하이브리드',
+    locationEn: 'London, UK · Hybrid',
+    salaryKo: '연 9,600만 원 (£54,000+)',
+    salaryEn: '£54,000+ / yr',
+    visaSupport: true,
+    langReqKo: '영어 업무 가능',
+    langReqEn: 'Fluent English',
+    experienceKo: '경력 2년↑',
+    experienceEn: '2+ yrs',
+    dDay: 'D-10',
+    badgeColor: 'bg-indigo-700',
+  },
+];
+
+// ============================================================================
+// 3. 통합 웹 애플리케이션 컴포넌트 (v3.1)
+// ============================================================================
+export default function StepWorldV31App() {
+  const [lang, setLang] = useState<'ko' | 'en'>('ko');
+  const [passport, setPassport] = useState<PassportCode>('KR');
+  const [birthYear, setBirthYear] = useState<number | null>(1998);
+  const [visitedWhv, setVisitedWhv] = useState<string[]>([]);
+  const [showProfileBar, setShowProfileBar] = useState(false);
+
+  const [activeTab, setActiveTab] = useState<'all' | 'whv' | 'travel' | 'work'>('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedCountryId, setSelectedCountryId] = useState<string | null>(null);
+  const [drawerTab, setDrawerTab] = useState<'visa' | 'safety' | 'play'>('visa');
+
+  const [savedIds, setSavedIds] = useState<string[]>(['au']);
+  const [appliedJobIds, setAppliedJobIds] = useState<string[]>([]);
+  const [jobCountryFilter, setJobCountryFilter] = useState<string>('all');
+
+  const [interestWeights, setInterestWeights] = useState<Record<string, number>>({
+    au: 1,
+    jp: 2,
+    ca: 0,
+    de: 0,
+    th: 0,
+    vn: 0,
+    ph: 0,
+    uk: 0,
+  });
+
+  const [reviews, setReviews] = useState<FieldReview[]>(INITIAL_REVIEWS);
+  const [draftCategory, setDraftCategory] = useState<'visa' | 'safety' | 'nightlife'>('safety');
+  const [draftText, setDraftText] = useState('');
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [lastSyncedLabel, setLastSyncedLabel] = useState('2026-11-27 자동 동기화됨');
+
+  const t = (ko: string, en: string) => (lang === 'ko' ? ko : en);
+
+  const boostInterest = (countryId: string, delta = 2) => {
+    setInterestWeights((prev) => ({
+      ...prev,
+      [countryId]: (prev[countryId] || 0) + delta,
+    }));
+  };
+
+  const openCountryDrawer = (countryId: string, tab: 'visa' | 'safety' | 'play' = 'visa') => {
+    boostInterest(countryId, 3);
+    setDrawerTab(tab);
+    setSelectedCountryId(countryId);
+  };
+
+  const toggleVisitedWhv = (countryId: string) => {
+    setVisitedWhv((prev) =>
+      prev.includes(countryId) ? prev.filter((id) => id !== countryId) : [...prev, countryId]
+    );
+  };
+
+  const evaluatedCountries = useMemo(() => {
+    const userCtx: UserProfileContext = {
+      passport,
+      birthYear,
+      visitedWhvCountries: visitedWhv,
+      interestWeights,
+    };
+
+    return INITIAL_COUNTRIES.map((country) => ({
+      country,
+      evalData: evaluateCountryForUser(country, userCtx, 2026),
+    }));
+  }, [passport, birthYear, visitedWhv, interestWeights]);
+
+  const filteredCountries = useMemo(() => {
+    return evaluatedCountries.filter(({ country, evalData }) => {
+      const q = searchQuery.trim().toLowerCase();
+      const matchesQuery =
+        !q ||
+        country.countryKo.toLowerCase().includes(q) ||
+        country.countryEn.toLowerCase().includes(q) ||
+        country.cityKo.toLowerCase().includes(q) ||
+        country.cityEn.toLowerCase().includes(q);
+
+      if (!matchesQuery) return false;
+      if (activeTab === 'whv') return evalData.effectiveWhvAvailable;
+      if (activeTab === 'travel') {
+        return evalData.rule.travelStatus === 'free' || evalData.rule.travelStatus === 'eta';
+      }
+      return true;
+    });
+  }, [evaluatedCountries, searchQuery, activeTab]);
+
+  const topInterestedItem = useMemo(() => {
+    const sorted = [...evaluatedCountries].sort(
+      (a, b) => b.evalData.priorityScore - a.evalData.priorityScore
+    );
+    return sorted[0];
+  }, [evaluatedCountries]);
+
+  const activeDrawerItem = useMemo(() => {
+    if (!selectedCountryId) return null;
+    return evaluatedCountries.find((item) => item.country.id === selectedCountryId) || null;
+  }, [selectedCountryId, evaluatedCountries]);
+
+  const rankedDrawerReviews = useMemo(() => {
+    if (!selectedCountryId) return [];
+    const countryOnly = reviews.filter((r) => r.countryId === selectedCountryId);
+    return rankAndFilterReviews(countryOnly);
+  }, [reviews, selectedCountryId]);
+
+  const filteredJobs = useMemo(() => {
+    return JOB_LISTINGS.filter((job) => {
+      if (jobCountryFilter !== 'all' && job.countryId !== jobCountryFilter) return false;
+      if (!searchQuery.trim()) return true;
+      const q = searchQuery.toLowerCase();
+      return (
+        job.titleKo.toLowerCase().includes(q) ||
+        job.titleEn.toLowerCase().includes(q) ||
+        job.company.toLowerCase().includes(q) ||
+        job.locationKo.toLowerCase().includes(q)
+      );
+    });
+  }, [jobCountryFilter, searchQuery]);
+
+  const handleSyncNow = () => {
+    setIsSyncing(true);
+    setTimeout(() => {
+      if (selectedCountryId) {
+        const autoNote: FieldReview = {
+          id: `auto-${Date.now()}`,
+          countryId: selectedCountryId,
+          passportCode: passport,
+          category: 'visa',
+          summary: t(
+            '자동 검증 완료: 최신 비자 규정·주의보 및 최근 후기 시간 감쇠 점수가 갱신되었습니다.',
+            'Auto-verified: Latest visa notices, safety alerts, and time-decayed review scores refreshed.'
+          ),
+          createdAtMs: Date.now(),
+          createdAtLabelKo: '방금 반영됨',
+          createdAtLabelEn: 'Just synced',
+          helpfulCount: 2,
+          outdatedCount: 0,
+          verifiedBySystem: true,
+        };
+        setReviews((prev) => [autoNote, ...prev]);
+        boostInterest(selectedCountryId, 2);
+      }
+      setLastSyncedLabel('2026-11-27 방금 동기화됨');
+      setIsSyncing(false);
+    }, 400);
+  };
+
+  const handleCreateReview = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedCountryId || !draftText.trim()) return;
+
+    const newReview: FieldReview = {
+      id: `rev-${Date.now()}`,
+      countryId: selectedCountryId,
+      passportCode: passport,
+      category: draftCategory,
+      summary: draftText.trim(),
+      createdAtMs: Date.now(),
+      createdAtLabelKo: '방금 등록됨',
+      createdAtLabelEn: 'Just posted',
+      helpfulCount: 1,
+      outdatedCount: 0,
+    };
+
+    setReviews((prev) => [newReview, ...prev]);
+    setDraftText('');
+    boostInterest(selectedCountryId, 3);
+  };
+
+  const voteReview = (id: string, type: 'helpful' | 'outdated') => {
+    setReviews((prev) =>
+      prev.map((r) => {
+        if (r.id !== id) return r;
+        return type === 'helpful'
+          ? { ...r, helpfulCount: r.helpfulCount + 1 }
+          : { ...r, outdatedCount: r.outdatedCount + 1 };
+      })
+    );
+  };
+
+  const getTravelBadgeClass = (status: 'free' | 'eta' | 'visa') => {
+    if (status === 'free') return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+    if (status === 'eta') return 'bg-sky-50 text-sky-700 border-sky-200';
+    return 'bg-amber-50 text-amber-700 border-amber-200';
+  };
+
+  return (
+    <div className="min-h-screen bg-[#F8FAFC] text-slate-900 font-sans antialiased pb-20">
+      {/* 1. 스티키 글로벌 헤더 */}
+      <header className="sticky top-0 z-30 bg-white/90 backdrop-blur-md border-b border-slate-200/80">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-blue-600 flex items-center justify-center text-white shadow-xs">
+              <Globe className="w-5 h-5" />
+            </div>
+            <div>
+              <span className="font-bold text-lg tracking-tight text-slate-900">StepWorld</span>
+              <span className="hidden md:inline-block ml-2 text-[11px] font-medium text-slate-400">
+                {lastSyncedLabel}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <div className="flex items-center bg-slate-100 p-1 rounded-xl border border-slate-200/70">
+              {PASSPORTS.map((p) => (
+                <button
+                  key={p.code}
+                  type="button"
+                  onClick={() => setPassport(p.code)}
+                  className={`px-2.5 sm:px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer ${
+                    passport === p.code
+                      ? 'bg-white text-blue-600 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {p.code} · {lang === 'ko' ? p.nameKo : p.nameEn}
+                </button>
+              ))}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowProfileBar((v) => !v)}
+              className={`h-9 px-3 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition cursor-pointer ${
+                showProfileBar
+                  ? 'bg-slate-900 text-white border-slate-900'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">{t('나이·이력 맞춤', 'Age & History')}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setLang(lang === 'ko' ? 'en' : 'ko')}
+              className="h-9 px-3 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-bold text-slate-700 transition cursor-pointer"
+            >
+              {lang === 'ko' ? 'EN' : '한국어'}
+            </button>
+          </div>
+        </div>
+
+        {/* 접이식 엣지케이스 입력 바 */}
+        {showProfileBar && (
+          <div className="bg-slate-50 border-t border-slate-200/80 py-3 px-4 sm:px-6">
+            <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-4 text-xs">
+              <div className="flex items-center gap-2">
+                <label className="font-bold text-slate-700">
+                  {t('출생연도 (만 나이 자동 계산):', 'Birth Year (Auto-age):')}
+                </label>
+                <input
+                  type="number"
+                  min={1960}
+                  max={2020}
+                  value={birthYear ?? ''}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value, 10);
+                    setBirthYear(Number.isNaN(val) ? null : val);
+                  }}
+                  placeholder="1998"
+                  className="w-24 h-8 px-2.5 rounded-lg bg-white border border-slate-300 font-semibold"
+                />
+                {birthYear && (
+                  <span className="text-blue-600 font-bold">
+                    ({t(`만 ${2026 - birthYear}세`, `Age ${2026 - birthYear}`)})
+                  </span>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="font-bold text-slate-700 mr-1">
+                  {t('과거 워홀 이력:', 'Past WHV:')}
+                </span>
+                {INITIAL_COUNTRIES.map((c) => {
+                  const checked = visitedWhv.includes(c.id);
+                  return (
+                    <button
+                      key={c.id}
+                      type="button"
+                      onClick={() => toggleVisitedWhv(c.id)}
+                      className={`px-2 py-1 rounded-lg font-bold border transition cursor-pointer ${
+                        checked
+                          ? 'bg-amber-100 text-amber-900 border-amber-300'
+                          : 'bg-white text-slate-600 border-slate-200'
+                      }`}
+                    >
+                      {t(c.countryKo, c.countryEn)}
+                    </button>
+                  );
+                })}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBirthYear(1998);
+                    setVisitedWhv([]);
+                  }}
+                  className="px-2 py-1 text-slate-500 hover:text-slate-800 flex items-center gap-1 cursor-pointer"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  {t('초기화', 'Reset')}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </header>
+
+      <main className="max-w-6xl mx-auto px-4 sm:px-6 pt-8 space-y-10">
+        {/* 2. 히어로 & 직관적 검색/필터 */}
+        <section className="bg-white rounded-3xl border border-slate-200/80 p-6 sm:p-8 shadow-xs">
+          <div className="max-w-2xl">
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-blue-50 text-blue-700 text-xs font-semibold mb-3">
+              <Sparkles className="w-3.5 h-3.5" />
+              {t(
+                `${PASSPORTS.find((p) => p.code === passport)?.nameKo} 여권 기준 8개국 실시간 분석`,
+                `8 Destinations Analyzed for ${PASSPORTS.find((p) => p.code === passport)?.nameEn}`
+              )}
+            </div>
+            <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-slate-900 leading-snug">
+              {t(
+                '비자 가능 여부부터 현지 채용·안전 이슈·낮과 밤의 즐길 거리까지 한곳에.',
+                'Visas, live safety advisories, jobs, and day & night guides in one clean place.'
+              )}
+            </h1>
+            <p className="text-sm text-slate-500 mt-2">
+              {t(
+                '내 여권과 나이·경험에 맞춰 신청 가능한 나라와 조건을 바로 확인하고, 현장의 최신 후기와 안전 정보를 확인하세요.',
+                'Check eligibility tailored to your passport and profile alongside real-time safety and traveler reports.'
+              )}
+            </p>
+          </div>
+
+          <div className="mt-6 flex flex-col md:flex-row gap-3">
+            <div className="relative flex-1">
+              <Search className="w-4 h-4 text-slate-400 absolute left-4 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={t('국가, 도시, 또는 직무 검색 (예: 태국, 방콕, 런던...)', 'Search country, city, or role...')}
+                className="w-full h-12 pl-11 pr-4 rounded-2xl bg-slate-50 border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition"
+              />
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              {[
+                { id: 'all', icon: Compass, ko: '전체 8개국', en: 'All 8' },
+                { id: 'whv', icon: Sparkles, ko: '워홀·YMS 가능국', en: 'WHV / YMS' },
+                { id: 'travel', icon: Plane, ko: '무비자 · ETA', en: 'Visa-Free / ETA' },
+                { id: 'work', icon: Briefcase, ko: '취업 · 채용', en: 'Jobs & Work' },
+              ].map((tab) => {
+                const Icon = tab.icon;
+                const active = activeTab === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setActiveTab(tab.id as any)}
+                    className={`h-12 px-4 rounded-2xl text-xs sm:text-sm font-semibold flex items-center gap-2 border transition cursor-pointer ${
+                      active
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    <Icon className="w-4 h-4" />
+                    {t(tab.ko, tab.en)}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+
+        {/* 3. 관심도 알고리즘 기반 '실시간 브리핑 & 즐길 거리' 배너 */}
+        {topInterestedItem && (
+          <section className="bg-slate-900 text-white rounded-3xl p-6 sm:p-8 shadow-md">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+              <div className="space-y-2 max-w-2xl">
+                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/10 text-sky-300 text-xs font-bold">
+                  <Flame className="w-3.5 h-3.5 text-amber-400" />
+                  {t(
+                    `관심 알고리즘 추천 · [${topInterestedItem.country.countryKo}] 브리핑`,
+                    `Smart Feed · [${topInterestedItem.country.countryEn}] Briefing`
+                  )}
+                </div>
+                <h2 className="text-xl sm:text-2xl font-extrabold tracking-tight">
+                  {t(
+                    `${topInterestedItem.country.countryKo} (${topInterestedItem.country.cityKo}) 현안 & 즐길 거리`,
+                    `${topInterestedItem.country.countryEn} (${topInterestedItem.country.cityEn}) Alerts & Lifestyle`
+                  )}
+                </h2>
+                <p className="text-xs sm:text-sm text-slate-300">
+                  {t(
+                    topInterestedItem.country.newsAlerts[0].titleKo,
+                    topInterestedItem.country.newsAlerts[0].titleEn
+                  )}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap gap-2.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => openCountryDrawer(topInterestedItem.country.id, 'safety')}
+                  className="px-4 py-3 rounded-2xl bg-white/10 hover:bg-white/20 text-xs font-bold flex items-center gap-2 transition cursor-pointer"
+                >
+                  <ShieldAlert className="w-4 h-4 text-amber-400" />
+                  {t('여행 주의 · 뉴스', 'Safety & News')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openCountryDrawer(topInterestedItem.country.id, 'play')}
+                  className="px-4 py-3 rounded-2xl bg-blue-600 hover:bg-blue-500 text-xs font-bold flex items-center gap-2 transition cursor-pointer"
+                >
+                  <Moon className="w-4 h-4 text-sky-200" />
+                  {t('낮·밤 나이트라이프', 'Day & Nightlife')}
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-6 pt-6 border-t border-white/10 text-xs">
+              <div className="bg-white/5 rounded-2xl p-4">
+                <span className="text-amber-300 font-bold flex items-center gap-1.5 mb-1.5">
+                  <Newspaper className="w-3.5 h-3.5" />
+                  {t('주요 체크 포인트', 'Key Advisory')}
+                </span>
+                <p className="text-slate-300 leading-relaxed">
+                  {t(
+                    topInterestedItem.country.newsAlerts[1].titleKo,
+                    topInterestedItem.country.newsAlerts[1].titleEn
+                  )}
+                </p>
+              </div>
+              <div className="bg-white/5 rounded-2xl p-4">
+                <span className="text-sky-300 font-bold flex items-center gap-1.5 mb-1.5">
+                  <Sun className="w-3.5 h-3.5" />
+                  {t('낮 즐길 거리', 'Daytime')}
+                </span>
+                <p className="text-slate-300 leading-relaxed">
+                  {(lang === 'ko'
+                    ? topInterestedItem.country.lifestyle.dayKo
+                    : topInterestedItem.country.lifestyle.dayEn
+                  )
+                    .slice(0, 2)
+                    .join(' · ')}
+                </p>
+              </div>
+              <div className="bg-white/5 rounded-2xl p-4">
+                <span className="text-indigo-300 font-bold flex items-center gap-1.5 mb-1.5">
+                  <Moon className="w-3.5 h-3.5" />
+                  {t('밤 유흥 · 라운지', 'Nightlife')}
+                </span>
+                <p className="text-slate-300 leading-relaxed">
+                  {(lang === 'ko'
+                    ? topInterestedItem.country.lifestyle.nightKo
+                    : topInterestedItem.country.lifestyle.nightEn
+                  )
+                    .slice(0, 2)
+                    .join(' · ')}
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* 4. 국가별 비자 · 워홀 · 엣지케이스 알림 카드 그리드 */}
+        <section>
+          <div className="flex items-center justify-between mb-4 px-1">
+            <h2 className="text-lg font-extrabold text-slate-900">
+              {t(
+                `국가별 비자 · 워홀 매트릭스 (${filteredCountries.length}개국)`,
+                `Country Visa & WHV Matrix (${filteredCountries.length})`
+              )}
+            </h2>
+            {(activeTab !== 'all' || searchQuery) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('all');
+                  setSearchQuery('');
+                }}
+                className="text-xs font-semibold text-blue-600 hover:underline cursor-pointer"
+              >
+                {t('필터 초기화', 'Reset filters')}
+              </button>
+            )}
+          </div>
+
+          {filteredCountries.length === 0 ? (
+            <div className="bg-white rounded-3xl border border-slate-200 p-10 text-center">
+              <p className="text-sm font-bold text-slate-800">
+                {t('현재 조건에 맞는 국가가 없습니다.', 'No countries match your current filter.')}
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveTab('all');
+                  setSearchQuery('');
+                }}
+                className="mt-3 px-4 py-2 rounded-xl bg-blue-600 text-white text-xs font-bold cursor-pointer"
+              >
+                {t('전체 국가 보기', 'Show all countries')}
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+              {filteredCountries.map(({ country, evalData }) => {
+                const { rule, effectiveWhvAvailable, whvStatusBadgeKo, whvStatusBadgeEn, warnings } =
+                  evalData;
+                const isSaved = savedIds.includes(country.id);
+
+                return (
+                  <div
+                    key={country.id}
+                    onClick={() => openCountryDrawer(country.id, 'visa')}
+                    className="group bg-white rounded-3xl border border-slate-200/90 p-6 hover:border-blue-400 hover:shadow-md transition-all cursor-pointer flex flex-col justify-between"
+                  >
+                    <div>
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3.5">
+                          <div className="w-12 h-12 rounded-2xl bg-slate-900 text-white font-extrabold text-sm flex items-center justify-center">
+                            {country.code}
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <h3 className="text-lg font-bold text-slate-900 group-hover:text-blue-600 transition">
+                                {t(country.countryKo, country.countryEn)}
+                              </h3>
+                              <span className="text-xs font-medium text-slate-400">
+                                {t(country.cityKo, country.cityEn)}
+                              </span>
+                              {rule.recentlyChanged && (
+                                <span className="px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200 text-[10px] font-bold">
+                                  {t('규정 변동', 'Updated')}
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs font-semibold text-blue-600 mt-0.5">
+                              {t(
+                                `채용 ${country.jobsCount.toLocaleString()}건 · ${country.avgSalaryKo}`,
+                                `${country.jobsCount.toLocaleString()} Jobs · ${country.avgSalaryEn}`
+                              )}
+                            </p>
+                          </div>
+                        </div>
+
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSavedIds((prev) =>
+                              prev.includes(country.id)
+                                ? prev.filter((id) => id !== country.id)
+                                : [...prev, country.id]
+                            );
+                          }}
+                          className={`w-10 h-10 rounded-xl border flex items-center justify-center transition cursor-pointer ${
+                            isSaved
+                              ? 'bg-blue-50 border-blue-200 text-blue-600'
+                              : 'bg-white border-slate-200 text-slate-400 hover:text-slate-700'
+                          }`}
+                        >
+                          <Bookmark className={`w-4 h-4 ${isSaved ? 'fill-blue-600' : ''}`} />
+                        </button>
+                      </div>
+
+                      {warnings.length > 0 && (
+                        <div className="mt-3.5 p-3 rounded-2xl bg-amber-50/90 border border-amber-200/80 text-[11px] font-semibold text-amber-900 space-y-1">
+                          {warnings.slice(0, 2).map((w, idx) => (
+                            <div key={idx} className="flex items-start gap-1.5">
+                              <AlertCircle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                              <span>{t(w.ko, w.en)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="mt-4 space-y-2">
+                        <div className="flex items-center justify-between p-3 rounded-2xl bg-slate-50/80 border border-slate-100">
+                          <span className="text-xs font-semibold text-slate-600 flex items-center gap-2">
+                            <Plane className="w-4 h-4 text-slate-400" />
+                            {t('여행 · 단기방문', 'Travel Visa')}
+                          </span>
+                          <span
+                            className={`px-2.5 py-1 rounded-lg text-xs font-bold border ${getTravelBadgeClass(
+                              rule.travelStatus
+                            )}`}
+                          >
+                            {t(rule.travelLabelKo, rule.travelLabelEn)}
+                          </span>
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-2xl bg-slate-50/80 border border-slate-100">
+                          <span className="text-xs font-semibold text-slate-600 flex items-center gap-2">
+                            <Sparkles className="w-4 h-4 text-slate-400" />
+                            {t('워킹홀리데이', 'Working Holiday')}
+                          </span>
+                          {effectiveWhvAvailable ? (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              {t(whvStatusBadgeKo, whvStatusBadgeEn)}
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                              <XCircle className="w-3.5 h-3.5" />
+                              {t(whvStatusBadgeKo, whvStatusBadgeEn)}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center justify-between p-3 rounded-2xl bg-slate-50/80 border border-slate-100">
+                          <span className="text-xs font-semibold text-slate-600 flex items-center gap-2">
+                            <Briefcase className="w-4 h-4 text-slate-400" />
+                            {t('취업 비자', 'Work Visa')}
+                          </span>
+                          <span className="text-xs font-bold text-slate-800">{rule.workVisa}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 pt-4 border-t border-slate-100 flex items-center justify-between gap-2">
+                      <div className="flex gap-1.5">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openCountryDrawer(country.id, 'safety');
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-800 text-[11px] font-bold transition cursor-pointer"
+                        >
+                          {t('안전·뉴스', 'Safety')}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openCountryDrawer(country.id, 'play');
+                          }}
+                          className="px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-800 text-[11px] font-bold transition cursor-pointer"
+                        >
+                          {t('즐길거리·유흥', 'Nightlife')}
+                        </button>
+                      </div>
+                      <span className="text-xs font-bold text-blue-600 flex items-center gap-1">
+                        {t('비자 신청법 & 후기', 'Guide & Reviews')}
+                        <ChevronRight className="w-4 h-4" />
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* 5. 잡코리아·사람인 스타일 8개국 글로벌 채용 공고 보드 */}
+        <section className="bg-white rounded-3xl border border-slate-200/90 p-6 sm:p-8 shadow-xs">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+            <div>
+              <h2 className="text-xl font-extrabold text-slate-900">
+                {t('글로벌 추천 채용 공고', 'Curated Global Jobs')}
+              </h2>
+              <p className="text-xs sm:text-sm text-slate-500 mt-1">
+                {t(
+                  '연봉, 비자 지원 여부, 언어 요건을 한눈에 비교하고 지원하세요.',
+                  'Compare salary, visa sponsorship, and language requirements at a glance.'
+                )}
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-1.5">
+              {[
+                { id: 'all', ko: '전체', en: 'All' },
+                { id: 'au', ko: '호주', en: 'AU' },
+                { id: 'jp', ko: '일본', en: 'JP' },
+                { id: 'ca', ko: '캐나다', en: 'CA' },
+                { id: 'de', ko: '독일', en: 'DE' },
+                { id: 'th', ko: '태국', en: 'TH' },
+                { id: 'vn', ko: '베트남', en: 'VN' },
+                { id: 'ph', ko: '필리핀', en: 'PH' },
+                { id: 'uk', ko: '영국', en: 'UK' },
+              ].map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => setJobCountryFilter(f.id)}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                    jobCountryFilter === f.id
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  {t(f.ko, f.en)}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="space-y-3">
+            {filteredJobs.map((job) => {
+              const applied = appliedJobIds.includes(job.id);
+              return (
+                <div
+                  key={job.id}
+                  className="p-5 rounded-2xl border border-slate-200/80 hover:border-blue-400 transition flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+                >
+                  <div className="flex items-start gap-4">
+                    <div
+                      className={`w-12 h-12 rounded-2xl ${job.badgeColor} text-white font-extrabold text-sm flex items-center justify-center shrink-0`}
+                    >
+                      {job.company.slice(0, 2).toUpperCase()}
+                    </div>
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-bold text-slate-500 flex items-center gap-1">
+                          <Building2 className="w-3.5 h-3.5" />
+                          {job.company}
+                        </span>
+                        <span className="text-xs font-bold px-2 py-0.5 rounded-md bg-slate-100 text-slate-600">
+                          {job.dDay}
+                        </span>
+                        {job.visaSupport && (
+                          <span className="text-xs font-bold px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200">
+                            {t('비자 스폰서 지원', 'Visa Sponsored')}
+                          </span>
+                        )}
+                      </div>
+
+                      <h3 className="text-base sm:text-lg font-extrabold text-slate-900 mt-1">
+                        {t(job.titleKo, job.titleEn)}
+                      </h3>
+
+                      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-xs text-slate-600 font-medium">
+                        <span className="flex items-center gap-1">
+                          <MapPin className="w-3.5 h-3.5 text-slate-400" />
+                          {t(job.locationKo, job.locationEn)}
+                        </span>
+                        <span className="font-bold text-blue-600">{t(job.salaryKo, job.salaryEn)}</span>
+                        <span>{t(job.langReqKo, job.langReqEn)}</span>
+                        <span>{t(job.experienceKo, job.experienceEn)}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAppliedJobIds((prev) =>
+                        prev.includes(job.id) ? prev : [...prev, job.id]
+                      );
+                      boostInterest(job.countryId, 2);
+                    }}
+                    className={`h-11 px-5 rounded-xl text-xs sm:text-sm font-bold flex items-center justify-center gap-1.5 shrink-0 transition cursor-pointer ${
+                      applied
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-slate-900 hover:bg-blue-600 text-white'
+                    }`}
+                  >
+                    {applied ? (
+                      <>
+                        <Check className="w-4 h-4" />
+                        {t('지원 완료', 'Applied')}
+                      </>
+                    ) : (
+                      <>
+                        <span>{t('간편 지원', 'Quick Apply')}</span>
+                        <ArrowUpRight className="w-4 h-4" />
+                      </>
+                    )}
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      </main>
+
+      {/* 6. 통합 상세 드로어 */}
+      {activeDrawerItem && (() => {
+        const { country, evalData } = activeDrawerItem;
+        const { rule, effectiveWhvAvailable, warnings } = evalData;
+
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex justify-end"
+            onClick={() => setSelectedCountryId(null)}
+          >
+            <div
+              className="w-full max-w-xl bg-white h-full overflow-y-auto p-6 sm:p-8 shadow-2xl flex flex-col justify-between"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div>
+                <div className="flex items-center justify-between pb-4 border-b border-slate-100">
+                  <div className="flex items-center gap-3">
+                    <div className="w-11 h-11 rounded-2xl bg-blue-600 text-white font-extrabold flex items-center justify-center">
+                      {country.code}
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-extrabold text-slate-900">
+                        {t(country.countryKo, country.countryEn)}
+                      </h3>
+                      <p className="text-xs font-semibold text-slate-500">
+                        {t(
+                          `${PASSPORTS.find((p) => p.code === passport)?.nameKo} 여권 기준 · 검증일 ${rule.lastVerifiedAt}`,
+                          `${PASSPORTS.find((p) => p.code === passport)?.nameEn} · Verified ${rule.lastVerifiedAt}`
+                        )}
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedCountryId(null)}
+                    className="w-10 h-10 rounded-xl bg-slate-100 hover:bg-slate-200 flex items-center justify-center text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2 p-1.5 bg-slate-100 rounded-2xl mt-5">
+                  {[
+                    { id: 'visa', ko: '비자 · 워홀', en: 'Visas & WHV' },
+                    { id: 'safety', ko: '안전 · 뉴스', en: 'Safety & News' },
+                    { id: 'play', ko: '낮·밤 유흥', en: 'Day & Night' },
+                  ].map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setDrawerTab(tab.id as any)}
+                      className={`py-2.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                        drawerTab === tab.id
+                          ? 'bg-white text-blue-600 shadow-xs'
+                          : 'text-slate-600 hover:text-slate-900'
+                      }`}
+                    >
+                      {t(tab.ko, tab.en)}
+                    </button>
+                  ))}
+                </div>
+
+                {drawerTab === 'visa' && (
+                  <div className="mt-5 space-y-5">
+                    {warnings.length > 0 && (
+                      <div className="p-3.5 rounded-2xl bg-amber-50 border border-amber-200 text-xs font-semibold text-amber-900 space-y-1">
+                        {warnings.map((w, i) => (
+                          <div key={i} className="flex items-start gap-2">
+                            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                            <span>{t(w.ko, w.en)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/60">
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-sm font-extrabold text-slate-900 flex items-center gap-2">
+                          <Sparkles className="w-4 h-4 text-blue-600" />
+                          {t('워킹홀리데이 / 청년 체류', 'Working Holiday / Youth')}
+                        </span>
+                        <span className="text-xs font-bold px-2.5 py-1 rounded-lg bg-white border border-slate-200">
+                          {rule.visaName}
+                        </span>
+                      </div>
+
+                      {effectiveWhvAvailable ? (
+                        <>
+                          <div className="grid grid-cols-2 gap-2 mb-4">
+                            <div className="bg-white p-3 rounded-xl border border-slate-100">
+                              <span className="text-[11px] text-slate-400 block">
+                                {t('연령 요건', 'Age Limit')}
+                              </span>
+                              <span className="text-sm font-bold text-slate-800">{rule.ageRange}</span>
+                            </div>
+                            <div className="bg-white p-3 rounded-xl border border-slate-100">
+                              <span className="text-[11px] text-slate-400 block">
+                                {t('쿼터 · 수수료', 'Quota & Fee')}
+                              </span>
+                              <span className="text-xs font-bold text-slate-800">
+                                {t(rule.quotaKo, rule.quotaEn)} · {rule.feeText}
+                              </span>
+                            </div>
+                          </div>
+
+                          <p className="text-xs font-bold text-slate-700 mb-2">
+                            {t('주요 조건', 'Requirements')}
+                          </p>
+                          <ul className="space-y-1.5 mb-4">
+                            {(lang === 'ko' ? rule.reqKo : rule.reqEn).map((req, i) => (
+                              <li key={i} className="text-xs text-slate-600 flex items-start gap-2">
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0 mt-0.5" />
+                                <span>{req}</span>
+                              </li>
+                            ))}
+                          </ul>
+
+                          <p className="text-xs font-bold text-slate-700 mb-2">
+                            {t('신청 절차', 'Application Steps')}
+                          </p>
+                          <ol className="space-y-2">
+                            {(lang === 'ko' ? rule.stepsKo : rule.stepsEn).map((step, i) => (
+                              <li
+                                key={i}
+                                className="text-xs text-slate-700 flex items-center gap-2.5 bg-white p-2.5 rounded-xl border border-slate-100"
+                              >
+                                <span className="w-5 h-5 rounded-full bg-blue-600 text-white text-[11px] font-bold flex items-center justify-center shrink-0">
+                                  {i + 1}
+                                </span>
+                                <span>{step}</span>
+                              </li>
+                            ))}
+                          </ol>
+                        </>
+                      ) : (
+                        <div className="text-xs text-slate-600 space-y-2">
+                          <p className="font-bold text-slate-800">
+                            {t(
+                              `대안 경로: ${rule.workVisa} — ${rule.workNoteKo}`,
+                              `Alternative: ${rule.workVisa} — ${rule.workNoteEn}`
+                            )}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="p-5 rounded-2xl border border-slate-200">
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-sm font-extrabold text-slate-900 flex items-center gap-2">
+                          <Plane className="w-4 h-4 text-sky-600" />
+                          {t('여행 · 단기 방문 비자', 'Travel / Short-Stay Visa')}
+                        </span>
+                        <span className="text-xs font-bold text-slate-600">{rule.travelFee}</span>
+                      </div>
+                      <ol className="space-y-1.5 mb-3">
+                        {(lang === 'ko' ? rule.travelStepsKo : rule.travelStepsEn).map((st, i) => (
+                          <li key={i} className="text-xs text-slate-600 flex items-start gap-2">
+                            <span className="font-bold text-blue-600">{i + 1}.</span>
+                            <span>{st}</span>
+                          </li>
+                        ))}
+                      </ol>
+                      <div className="flex flex-wrap gap-1.5">
+                        {(lang === 'ko' ? rule.travelDocsKo : rule.travelDocsEn).map((doc, i) => (
+                          <span
+                            key={i}
+                            className="px-2.5 py-1 rounded-lg bg-slate-100 text-slate-700 text-xs font-medium"
+                          >
+                            {doc}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {drawerTab === 'safety' && (
+                  <div className="mt-5 space-y-4">
+                    <div className="p-4 rounded-2xl bg-slate-900 text-white flex items-center justify-between">
+                      <div className="flex items-center gap-2.5">
+                        <PhoneCall className="w-4 h-4 text-amber-400" />
+                        <span className="text-xs font-bold">
+                          {t('긴급 번호', 'Emergency')} ·{' '}
+                          {t(
+                            `법적 음주 만 ${country.legalDrinkingAge}세`,
+                            `Drinking Age ${country.legalDrinkingAge}+`
+                          )}
+                        </span>
+                      </div>
+                      <span className="text-sm font-extrabold text-amber-300">
+                        {country.emergencyNumber}
+                      </span>
+                    </div>
+
+                    {country.newsAlerts.map((alert, i) => (
+                      <div
+                        key={i}
+                        className="p-4 rounded-2xl border border-amber-200/80 bg-amber-50/40"
+                      >
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="px-2 py-0.5 rounded-md bg-amber-100 text-amber-900 text-[11px] font-bold">
+                            {t(alert.tagKo, alert.tagEn)}
+                          </span>
+                          <span className="text-[11px] text-slate-400">{alert.date}</span>
+                        </div>
+                        <p className="text-xs sm:text-sm font-bold text-slate-900 leading-snug">
+                          {t(alert.titleKo, alert.titleEn)}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {drawerTab === 'play' && (
+                  <div className="mt-5 space-y-4">
+                    <div className="p-5 rounded-2xl border border-slate-200">
+                      <h4 className="text-sm font-extrabold text-slate-900 flex items-center gap-2 mb-3">
+                        <Sun className="w-4 h-4 text-amber-500" />
+                        {t('낮 즐길 거리', 'Daytime Highlights')}
+                      </h4>
+                      <ul className="space-y-2">
+                        {(lang === 'ko' ? country.lifestyle.dayKo : country.lifestyle.dayEn).map(
+                          (item, i) => (
+                            <li
+                              key={i}
+                              className="text-xs font-medium text-slate-700 bg-slate-50 p-3 rounded-xl"
+                            >
+                              {item}
+                            </li>
+                          )
+                        )}
+                      </ul>
+                    </div>
+
+                    <div className="p-5 rounded-2xl border border-indigo-200 bg-indigo-50/30">
+                      <h4 className="text-sm font-extrabold text-slate-900 flex items-center gap-2 mb-3">
+                        <Moon className="w-4 h-4 text-indigo-600" />
+                        {t('밤 유흥 · 라운지 & 바', 'Nightlife, Lounges & Bars')}
+                      </h4>
+                      <ul className="space-y-2 mb-4">
+                        {(lang === 'ko' ? country.lifestyle.nightKo : country.lifestyle.nightEn).map(
+                          (item, i) => (
+                            <li
+                              key={i}
+                              className="text-xs font-medium text-slate-800 bg-white p-3 rounded-xl border border-indigo-100"
+                            >
+                              {item}
+                            </li>
+                          )
+                        )}
+                      </ul>
+                      <div className="p-3.5 rounded-xl bg-slate-900 text-white text-xs leading-relaxed">
+                        <span className="font-bold text-amber-300 block mb-1">
+                          {t('밤 문화 안전 수칙', 'Nightlife Safety Tip')}
+                        </span>
+                        {t(country.lifestyle.nightTipKo, country.lifestyle.nightTipEn)}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="mt-6 p-5 rounded-2xl border border-slate-200 bg-slate-50/70 space-y-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <h4 className="text-sm font-extrabold text-slate-900 flex items-center gap-1.5">
+                        <Sparkles className="w-4 h-4 text-blue-600" />
+                        {t('현장 후기 & 자가 갱신 피드', 'Live Field Reports & Auto-Sync')}
+                      </h4>
+                      <p className="text-[11px] text-slate-500 flex items-center gap-1 mt-0.5">
+                        <Clock className="w-3 h-3" />
+                        {t(
+                          '최근 후기 가중치 우선 정렬 · 오래된 정보 자동 감쇠',
+                          'Ranked by freshness & helpfulness with time-decay'
+                        )}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleSyncNow}
+                      className="px-3 py-1.5 rounded-xl bg-white hover:bg-slate-100 border border-slate-200 text-xs font-bold text-slate-700 flex items-center gap-1.5 transition cursor-pointer"
+                    >
+                      <RefreshCw
+                        className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin text-blue-600' : ''}`}
+                      />
+                      {t('최신 동기화', 'Sync')}
+                    </button>
+                  </div>
+
+                  <form
+                    onSubmit={handleCreateReview}
+                    className="bg-white p-3 rounded-2xl border border-slate-200/80 space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold text-slate-500 flex items-center gap-1">
+                        <MessageSquarePlus className="w-3.5 h-3.5 text-blue-600" />
+                        {t('현장 정보 공유', 'Add field report')}
+                      </span>
+                      <select
+                        value={draftCategory}
+                        onChange={(e) => setDraftCategory(e.target.value as any)}
+                        className="text-xs font-bold bg-slate-100 text-slate-700 px-2 py-1 rounded-lg border border-slate-200"
+                      >
+                        <option value="visa">{t('비자/입국', 'Visa/Entry')}</option>
+                        <option value="safety">{t('안전/이슈', 'Safety')}</option>
+                        <option value="nightlife">{t('즐길거리/유흥', 'Nightlife')}</option>
+                      </select>
+                    </div>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={draftText}
+                        onChange={(e) => setDraftText(e.target.value)}
+                        placeholder={t(
+                          '최근 비자 진행, 치안, 밤문화 체감 후기를 남겨주세요',
+                          'Share a recent visa, safety, or nightlife tip'
+                        )}
+                        className="flex-1 h-10 px-3 rounded-xl bg-slate-50 border border-slate-200 text-xs focus:outline-none focus:border-blue-500"
+                      />
+                      <button
+                        type="submit"
+                        className="px-4 h-10 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold cursor-pointer"
+                      >
+                        {t('등록', 'Post')}
+                      </button>
+                    </div>
+                  </form>
+
+                  <div className="space-y-2.5">
+                    {rankedDrawerReviews.map((rev) => {
+                      const flaggedOutdated =
+                        rev.outdatedCount >= 3 && rev.outdatedCount > rev.helpfulCount;
+                      return (
+                        <div
+                          key={rev.id}
+                          className={`p-3.5 rounded-2xl border text-xs space-y-2 ${
+                            rev.verifiedBySystem
+                              ? 'bg-blue-50/70 border-blue-200'
+                              : 'bg-white border-slate-200/80'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              {rev.verifiedBySystem ? (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-blue-600 text-white text-[10px] font-bold">
+                                  <ShieldCheck className="w-3 h-3" />
+                                  {t('자동 검증', 'Auto-Verified')}
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 text-[10px] font-bold">
+                                  {rev.passportCode} · {rev.category.toUpperCase()}
+                                </span>
+                              )}
+                              <span className="text-[11px] text-slate-400">
+                                {t(rev.createdAtLabelKo, rev.createdAtLabelEn)}
+                              </span>
+                            </div>
+
+                            {flaggedOutdated && (
+                              <span className="inline-flex items-center gap-1 text-[10px] font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-md">
+                                <AlertTriangle className="w-3 h-3" />
+                                {t('변동 주의', 'Check current rule')}
+                              </span>
+                            )}
+                          </div>
+
+                          <p className="text-slate-800 leading-relaxed font-medium">{rev.summary}</p>
+
+                          <div className="flex items-center justify-between pt-1">
+                            <button
+                              type="button"
+                              onClick={() => voteReview(rev.id, 'helpful')}
+                              className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-700 hover:underline cursor-pointer"
+                            >
+                              <ThumbsUp className="w-3 h-3" />
+                              {t(`도움됨 (${rev.helpfulCount})`, `Helpful (${rev.helpfulCount})`)}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => voteReview(rev.id, 'outdated')}
+                              className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-400 hover:text-amber-700 cursor-pointer"
+                            >
+                              {t(`현재와 다름 (${rev.outdatedCount})`, `Outdated (${rev.outdatedCount})`)}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <div className="pt-5 mt-6 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setJobCountryFilter(country.id);
+                    setSelectedCountryId(null);
+                  }}
+                  className="w-full h-12 rounded-2xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-bold flex items-center justify-center gap-2 transition cursor-pointer"
+                >
+                  <span>
+                    {t(
+                      `${country.countryKo} 채용 공고 보기`,
+                      `View Jobs in ${country.countryEn}`
+                    )}
+                  </span>
+                  <ArrowUpRight className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
